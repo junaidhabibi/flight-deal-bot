@@ -139,11 +139,33 @@ sec "5/6  GitHub"
 # Everything after the sign-in is automatic, including the secrets --
 # they're read straight from .env and handed to gh, so they never get
 # typed, pasted, or shown on screen.
+# Homebrew's installer does NOT put brew on your PATH -- it prints three
+# "Next steps" commands and leaves them to you. So `command -v brew` means
+# "brew is on this shell's PATH", not "brew is installed", and a fresh
+# install looks identical to no install at all. Look where it actually
+# lives: /opt/homebrew on Apple Silicon, /usr/local on Intel.
+BREW=""
+for candidate in "$(command -v brew 2>/dev/null)" /opt/homebrew/bin/brew /usr/local/bin/brew; do
+  [ -n "$candidate" ] && [ -x "$candidate" ] && { BREW="$candidate"; break; }
+done
+
+if [ -n "$BREW" ]; then
+  eval "$("$BREW" shellenv)"          # puts brew and anything it installs on PATH
+  # Make it stick for future terminals, the way the installer intended.
+  ZP="$HOME/.zprofile"
+  if ! grep -q 'brew shellenv' "$ZP" 2>/dev/null; then
+    printf '\neval "$(%s shellenv)"\n' "$BREW" >> "$ZP"
+    ok "Added Homebrew to your PATH in ~/.zprofile (new terminals will have it)"
+  fi
+fi
+
 if ! command -v gh >/dev/null 2>&1; then
-  if command -v brew >/dev/null 2>&1; then
+  if [ -n "$BREW" ]; then
     printf "  Installing the GitHub CLI (one-off, ~30s)...\n"
-    brew install gh >/dev/null 2>&1 && ok "gh installed" \
-      || die "brew install gh failed. Run it yourself, then re-run ./deploy.sh"
+    "$BREW" install gh >/dev/null 2>&1 || die "brew install gh failed."
+    eval "$("$BREW" shellenv)"
+    command -v gh >/dev/null 2>&1 || die "gh installed but isn't on PATH."
+    ok "gh installed"
   else
     die "Homebrew isn't installed. Get it from https://brew.sh, then re-run this."
   fi
