@@ -304,7 +304,15 @@ class LayoverEstimate:
 
     @property
     def is_known_bad(self) -> bool:
-        """Dead zone AND confident enough to act on."""
+        """A band we refuse, confident enough to act on.
+
+        TOO_LONG was missing from this until 2026-09-19, so a fare with an
+        estimated 500-hour layover was kept silently. The dead zone needs
+        the confidence check because its estimate sits near a boundary;
+        TOO_LONG is never a near miss.
+        """
+        if self.band == TOO_LONG:
+            return True
         return self.band == DEAD_ZONE and self.confident
 
 
@@ -323,6 +331,13 @@ def assess_api_layover(
     margin, so a nonstop-ish routing with a long detour isn't binned for a
     layover it doesn't have.
     """
+    if transfers is None:
+        # The source didn't say. Not the same as nonstop, and the difference
+        # decides whether the whole layover rule applies.
+        return LayoverEstimate(
+            None, None, False, "stop count not reported -- layover unknown"
+        )
+
     if transfers < 1:
         return LayoverEstimate(0.0, QUICK, True, "nonstop -- no layover")
 
@@ -345,6 +360,19 @@ def assess_api_layover(
                  f"{rules.quick_max_hours:.0f}h to be routing detour"
         )
         return LayoverEstimate(hours, band, confident, reason)
+
+    if band == TOO_LONG:
+        # Past overnight_max_hours. This was returned as is_known_bad=False
+        # and therefore never rejected and never even flagged -- a fare with
+        # an estimated 544-hour layover would have been kept and the email
+        # would have printed it. It is also what a units mix-up looks like
+        # (duration delivered in seconds rather than minutes), so treating
+        # it as bad catches a whole class of upstream change.
+        return LayoverEstimate(
+            hours, band, True,
+            f"estimated ~{hours:.0f}h layover -- beyond the "
+            f"{rules.overnight_max_hours:.0f}h limit",
+        )
 
     return LayoverEstimate(
         hours, band, True, f"estimated ~{hours:.1f}h layover"

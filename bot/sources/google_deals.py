@@ -409,11 +409,19 @@ class GoogleTravelExplore:
             row.get("end_date") or row.get("return_date")
         )
 
-        stops = row.get("number_of_stops", row.get("stops"))
+        # A missing or unparseable stop count must NOT become 0. It used to,
+        # and "0 stops" short-circuits the entire layover rule as "nonstop --
+        # no layover": the 9-hour-Frankfurt check silently becomes a no-op
+        # and the email confidently prints "nonstop". If the field is absent
+        # or malformed we genuinely do not know, so say so with None and let
+        # the estimator flag it.
+        raw_stops = row.get("number_of_stops")
+        if raw_stops is None:
+            raw_stops = row.get("stops")
         try:
-            stops = int(stops) if stops is not None else 0
+            stops = int(raw_stops) if raw_stops is not None else None
         except (TypeError, ValueError):
-            stops = 0
+            stops = None
 
         city = (city_lookup or {}).get(code) or row.get("name") or code
 

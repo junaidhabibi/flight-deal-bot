@@ -199,14 +199,37 @@ class History:
         return int(cur.fetchone()["c"])
 
     def prune(self, keep_days: int = 540) -> int:
-        """Drop very old observations so the DB doesn't grow forever."""
-        cutoff = _iso(_utcnow() - timedelta(days=keep_days))
+        """Drop old rows so the DB -- and the repo that carries it -- stays small.
+
+        This file is committed on every run, and SQLite does not delta-
+        compress, so each run stores a whole new blob. Only `observations`
+        and `api_calls` used to be pruned; `runs`, `alerts` and `seen_rss`
+        grew forever. seen_rss was the worst: one row per feed item ever
+        seen, with an infinite dedupe window, on a feed that publishes daily.
+        """
+        now = _utcnow()
+        cutoff = _iso(now - timedelta(days=keep_days))
         with self._tx() as c:
             cur = c.execute("DELETE FROM observations WHERE observed_at < ?", (cutoff,))
             # Individual call rows are only needed for the 24h window.
             c.execute(
                 "DELETE FROM api_calls WHERE called_at < ?",
-                (_iso(_utcnow() - timedelta(days=3)),),
+                (_iso(now - timedelta(days=3)),),
+            )
+            # Run log: enough to spot a pattern, not a permanent archive.
+            c.execute(
+                "DELETE FROM runs WHERE started_at < ?",
+                (_iso(now - timedelta(days=90)),),
+            )
+            # Alerts feed the dedupe window (72h) and the daily cap (24h).
+            c.execute(
+                "DELETE FROM alerts WHERE sent_at < ?",
+                (_iso(now - timedelta(days=30)),),
+            )
+            # A deal post older than this is not coming back.
+            c.execute(
+                "DELETE FROM seen_rss WHERE seen_at < ?",
+                (_iso(now - timedelta(days=60)),),
             )
         return cur.rowcount
 
@@ -235,6 +258,22 @@ class History:
                     json.dumps(deal.to_dict(), default=str),
                 ),
             )
+
+    def emails_sent_since(self, hours: int) -> int:
+        """How many EMAILS went out, not how many deals were in them.
+
+        record_alert() writes a row per deal, so counting rows made one
+        email carrying 7 deals look like 7 emails and tripped the daily cap
+        instantly. Deals mailed together share a sent_at to the second, so
+        counting distinct timestamps counts messages.
+        """
+        cutoff = _iso(_utcnow() - timedelta(hours=hours))
+        cur = self._conn.execute(
+            "SELECT COUNT(DISTINCT substr(sent_at, 1, 19)) AS c "
+            "FROM alerts WHERE sent_at >= ?",
+            (cutoff,),
+        )
+        return int(cur.fetchone()["c"])
 
     def alerts_sent_since(self, hours: int) -> int:
         cutoff = _iso(_utcnow() - timedelta(hours=hours))

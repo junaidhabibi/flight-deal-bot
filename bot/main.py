@@ -324,7 +324,12 @@ class FlightDealBot:
         successive runs walk through the rest. With runs every 2 hours the
         whole list still gets covered several times a day.
         """
-        if count >= len(items) or count <= 0:
+        if count <= 0:
+            # "No budget left" -- emphatically NOT "scan the whole list",
+            # which is what this used to return and would have fired ~968
+            # requests into a 15-minute job timeout.
+            return []
+        if count >= len(items):
             return list(items)
         start = (self.run_index * count + salt) % len(items)
         doubled = list(items) + list(items)
@@ -617,9 +622,13 @@ class FlightDealBot:
             max_price=self.cfg.thresholds.get("max_price_usd"),
             seen=seen,
         )
-        for item in fresh:
-            self.hist.mark_rss_seen(item.guid)
-
+        # NOT marked seen here. Marking on FETCH meant an item found by a
+        # non-digest run (6 of every 7) was recorded as seen, never emailed,
+        # and then filtered out of the digest run that would have sent it.
+        # The post was destroyed silently and the log read "3 relevant new
+        # posts" either way. These are the mistake-fare feeds -- the fastest
+        # signal the bot has. They are marked seen in dispatch(), once they
+        # have actually gone out.
         log.info("RSS: %d relevant new posts (of %d)", len(fresh), len(items))
         return fresh
 
@@ -651,6 +660,7 @@ class FlightDealBot:
         insights: Dict[str, PriceInsight] = {}
 
         for deal in candidates[:limit]:
+            before = self.serp.call_count
             try:
                 insight = self.serp.verify(
                     origin=deal.origin,
@@ -662,7 +672,6 @@ class FlightDealBot:
                     max_stops=self.cfg.trip.get("max_extra_stops", 1),
                 )
                 insights[deal.fingerprint()] = insight
-                self.hist.bump_api_calls("serpapi", 1)
                 log.info(
                     "Verified %s: Google typical %s-%s, level=%s",
                     deal.route,
@@ -673,6 +682,15 @@ class FlightDealBot:
             except SerpApiError as e:
                 self._note_error(f"SerpApi verify {deal.route}: {e}")
                 break  # quota or key problem: stop burning calls
+            finally:
+                # Bill whatever left the machine, success or not. Billing
+                # only on success under-reported the ledger during a flaky
+                # week, so _serpapi_room saw headroom that wasn't there and
+                # the real 250/month tier ran out early -- after which the
+                # Europe sweep, the only fare source, starts 429-ing.
+                spent = self.serp.call_count - before
+                if spent > 0:
+                    self.hist.bump_api_calls("serpapi", spent)
 
         return insights
 
@@ -738,15 +756,23 @@ class FlightDealBot:
 
         rss_items = self.scan_rss()
 
-        sent = self.dispatch(final, rss_items, send_digest=send_digest)
-
-        # Now that scoring is done, everything observed goes into the record
-        # book -- deal or not. This is what makes "lowest ever" meaningful
+        # Scoring is done, so everything observed goes into the record book
+        # now -- deal or not. This is what makes "lowest ever" mean anything
         # on the next run.
+        #
+        # Deliberately BEFORE dispatch. It used to come after, so any
+        # exception while composing or sending an email (a missing field, an
+        # encoding error) threw away the whole run's price observations,
+        # while rows already written to `alerts` survived -- leaving the
+        # dedupe record without the price record it was supposed to match.
+        # Sending is the failure-prone step; the data is the valuable part.
         n_obs = self.hist.record_observations(raw)
         log.info("Recorded %d observations", n_obs)
 
+        sent = self.dispatch(final, rss_items, send_digest=send_digest)
+
         self.hist.prune()
+        self._check_for_silence(n_obs)
         self.hist.finish_run(
             run_id,
             observations=n_obs,
@@ -757,6 +783,64 @@ class FlightDealBot:
         log.info("Run %d done: %d candidates, %d emails", run_id, len(final), sent)
         return sent
 
+    def _check_for_silence(self, observations_this_run: int) -> None:
+        """Email if the bot has stopped seeing fares at all.
+
+        The dangerous failure here is not a crash, it is a shrug. If SerpApi
+        renames a field, changes how arrival_area_id works, or starts
+        returning an empty list for an area it no longer supports, explore()
+        returns [] with no exception. The run logs "Europe sweep: 0 fares",
+        records nothing, exits 0, and GitHub shows a green check -- forever.
+        Nobody reads the logs of a passing job, so the bot could be dead for
+        months and look perfectly healthy.
+
+        Zero observations on one run is normal. Zero on every run for a day
+        is not, and is worth an email even though it is not a deal.
+        """
+        if observations_this_run > 0:
+            return
+
+        a = self.cfg.alerts
+        threshold = int(a.get("silence_warning_after_runs", 6))
+        if threshold <= 0:
+            return
+
+        # Count back through finished runs until one found something.
+        streak = 1  # this run
+        for row in self.hist.recent_runs(threshold * 3):
+            if row["finished_at"] is None:
+                continue
+            if (row["observations"] or 0) > 0:
+                break
+            streak += 1
+
+        if streak < threshold or streak % threshold != 0:
+            return
+
+        log.warning(
+            "No fares seen in %d consecutive runs -- warning by email.", streak
+        )
+        hours = streak * 4
+        try:
+            self.emailer.send(
+                "[Flights] Heads up: the bot has stopped finding fares",
+                f"The last {streak} runs (about {hours} hours) all returned "
+                f"zero fares.\n\n"
+                f"That is not the same as 'no deals right now' -- the bot "
+                f"records every fare it sees, deal or not, so zero means it "
+                f"is not seeing the data at all.\n\n"
+                f"Most likely causes, in order:\n"
+                f"  1. The SerpApi free tier is exhausted for the month.\n"
+                f"  2. The SERPAPI_KEY secret expired or was regenerated.\n"
+                f"  3. Google Travel Explore changed its response format.\n\n"
+                f"Check the most recent run's log under the Actions tab.\n\n"
+                f"Errors recorded this run:\n"
+                + ("\n".join(f"  - {e}" for e in self.errors) or "  (none)")
+                + "\n",
+            )
+        except EmailError as e:
+            log.error("Couldn't send the silence warning: %s", e)
+
     def dispatch(
         self, deals: List[Deal], rss_items: List, send_digest: bool = False
     ) -> int:
@@ -766,9 +850,17 @@ class FlightDealBot:
         daily_cap = int(a.get("max_emails_per_day", 6))
         max_per_email = int(a.get("max_deals_per_email", 12))
 
-        already = self.hist.alerts_sent_since(24)
+        # Count EMAILS, not deals. record_alert() writes one row per deal, so
+        # comparing that count to max_emails_per_day meant a single email
+        # carrying 7 deals tripped a cap of 6 -- and the bot went silent for
+        # 24 hours immediately after finding a sale, which is exactly when a
+        # follow-up error fare is most likely.
+        already = self.hist.emails_sent_since(24)
         if already >= daily_cap and not send_digest:
-            log.info("Daily email cap (%d) reached.", daily_cap)
+            log.info(
+                "Daily email cap reached (%d of %d emails in 24h).",
+                already, daily_cap,
+            )
             return 0
 
         fresh = [
@@ -795,26 +887,43 @@ class FlightDealBot:
             except EmailError as e:
                 self._note_error(str(e))
 
+        rss_sent: List[Any] = []
+
+        # A hot post goes out on its own run. It used to be skipped entirely
+        # whenever the same run also had an urgent deal ("and not urgent"),
+        # and since it had already been marked seen it never came back.
         hot_rss = [i for i in rss_items if i.is_hot]
-        if hot_rss and not urgent:
+        if hot_rss:
             try:
                 if self.emailer.send_deals([], rss_items=hot_rss):
+                    rss_sent.extend(hot_rss)
                     sent += 1
             except EmailError as e:
                 self._note_error(str(e))
 
-        if send_digest and (rest or rss_items):
+        # Anything not already mailed above waits for the digest.
+        held_rss = [i for i in rss_items if i not in rss_sent]
+        if send_digest and (rest or held_rss):
             try:
                 if self.emailer.send_deals(
-                    rest, urgent=False, rss_items=rss_items, max_deals=max_per_email
+                    rest, urgent=False, rss_items=held_rss, max_deals=max_per_email
                 ):
                     for d in rest[:max_per_email]:
                         self.hist.record_alert(d)
+                    rss_sent.extend(held_rss)
                     sent += 1
             except EmailError as e:
                 self._note_error(str(e))
-        elif rest:
-            log.info("%d deals held for the next digest", len(rest))
+        elif rest or held_rss:
+            log.info(
+                "Holding %d deals and %d posts for the next digest",
+                len(rest), len(held_rss),
+            )
+
+        # Only now is an item really "seen". Anything that didn't go out
+        # stays unseen and gets another chance on the next run.
+        for item in rss_sent:
+            self.hist.mark_rss_seen(item.guid)
 
         return sent
 
@@ -967,8 +1076,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("Sent." if ok else "Failed.")
             return 0 if ok else 1
 
-        sent = bot.run(send_digest=args.digest)
-        return 0 if not bot.errors else 0 if sent else 1
+        bot.run(send_digest=args.digest)
+        # An error is an error. This used to return 0 whenever any email had
+        # gone out, so a run where the Europe sweep 401'd but a stale RSS
+        # post got mailed reported success and showed a green check.
+        return 1 if bot.errors else 0
     except KeyboardInterrupt:
         return 130
     except Exception:

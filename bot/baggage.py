@@ -449,7 +449,12 @@ class BaggageAdvisor:
                 except (IndexError, ValueError):
                     pass
 
-            if code.upper() in UNKNOWN_CARRIER_CODES or code not in POLICIES:
+            # Both halves must uppercase. They didn't, so "sk" took the
+            # unknown-carrier branch: SAS's risk scores were applied, its
+            # $40/segment fee was not, and the email announced the operating
+            # airline was unidentified while naming it.
+            if (code.upper() in UNKNOWN_CARRIER_CODES
+                    or code.upper() not in POLICIES):
                 # We do not know who is flying this, so we do not know what
                 # the bag costs. Google Explore reports "multi" for any
                 # itinerary with two operating carriers, which is most of

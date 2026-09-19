@@ -232,7 +232,21 @@ class Emailer:
                     + (" (estimated)" if d.layover_estimated else "")
                 )
             elif d.layover_band == "quick" and d.layover_hours == 0:
-                lines.append("   Layover:    none -- nonstop")
+                # Only call it nonstop if the itinerary actually has no
+                # stops. The estimator clamps a negative excess to 0.0, and
+                # its expected flight time is deliberately generous, so a
+                # 1-stop fare landing on 0.0 hours is routine -- this line
+                # used to tell the reader a connecting fare was a nonstop,
+                # which is the single fact most likely to make them book
+                # without checking.
+                stops = d.legs[0].stops if d.legs else None
+                if stops == 0:
+                    lines.append("   Layover:    none -- nonstop")
+                else:
+                    lines.append(
+                        "   Layover:    connection, length not reported "
+                        "-- CHECK BEFORE BOOKING"
+                    )
             lines.append(f"   Depart:     {d.depart_date.strftime('%a %b %d, %Y')}")
             if d.return_date:
                 lines.append(
@@ -481,9 +495,18 @@ class Emailer:
                     f"{approx}{d.layover_hours:.1f}h{est}</div>"
                 )
             elif d.layover_band == "quick" and d.layover_hours == 0:
-                parts.append(
-                    '<div><span class="lbl">Layover</span>none &mdash; nonstop</div>'
-                )
+                stops = d.legs[0].stops if d.legs else None
+                if stops == 0:
+                    parts.append(
+                        '<div><span class="lbl">Layover</span>'
+                        "none &mdash; nonstop</div>"
+                    )
+                else:
+                    parts.append(
+                        '<div><span class="lbl">Layover</span>'
+                        "connection, length not reported &mdash; "
+                        "<b>check before booking</b></div>"
+                    )
             if d.airline:
                 parts.append(
                     f'<div><span class="lbl">Airline</span>{_esc(d.airline)}</div>'

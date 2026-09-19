@@ -94,7 +94,7 @@ git config user.email >/dev/null 2>&1 || git config user.email "junaid_64@live.c
 if git diff --cached --quiet; then
   ok "Nothing new to commit"
 else
-  git commit -q -m "Switch to Google Travel Explore as the fare source
+  git commit -q -m "Switch to Google Travel Explore, and fix what an audit found
 
 Travelpayouts' cache has no DFW-to-Europe fares, so the old scan
 returned nothing. Explore answers 'what's cheap from DFW to anywhere
@@ -110,63 +110,87 @@ Also fixes, all caught by rehearsing the pipeline on real data:
   - alerting off a comparison against the price ceiling, which
     manufactures a discount out of a preference
   - unittest.main() sitting mid-file, so the suite the Action runs
-    silently skipped 11 tests"
+    silently skipped 11 tests
+
+Then a full audit, which found nine more of the same kind:
+  - RSS items marked seen on FETCH, so anything found by a non-digest
+    run (6 of every 7) was recorded, never sent, and then filtered out
+    of the digest that would have sent it
+  - the daily email cap counting DEALS, so one email of 7 deals tripped
+    a cap of 6 and gagged the bot for a day right after a sale
+  - no way to tell 'no deals today' from 'the source is broken': both
+    exit 0 and show a green check. Added a silence warning.
+  - a missing stop count defaulting to 0, which short-circuits the whole
+    layover rule as 'nonstop' and prints that in the email
+  - a >120h layover estimate never rejected, and never even flagged
+  - the email calling a connecting itinerary 'nonstop'
+  - the workflow's push retry ending on sleep, so a lost price history
+    exited 0
+  - failed verifications not billed, under-reporting the API ledger
+  - the dead-zone estimate discarding fares it cannot distinguish from
+    a routing detour (Istanbul adds 5h of real flying to DFW-ARN)"
   ok "Committed"
 fi
 
 # ------------------------------------------------------------- 5. GitHub
 sec "5/6  GitHub"
-if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-  USER=$(gh api user -q .login)
-  if gh repo view "$USER/$REPO_NAME" >/dev/null 2>&1; then
-    ok "Repo exists: $USER/$REPO_NAME"
-    git remote get-url origin >/dev/null 2>&1 \
-      || git remote add origin "https://github.com/$USER/$REPO_NAME.git"
+
+# The only step that genuinely needs you: GitHub has to know it's you.
+# Everything after the sign-in is automatic, including the secrets --
+# they're read straight from .env and handed to gh, so they never get
+# typed, pasted, or shown on screen.
+if ! command -v gh >/dev/null 2>&1; then
+  if command -v brew >/dev/null 2>&1; then
+    printf "  Installing the GitHub CLI (one-off, ~30s)...\n"
+    brew install gh >/dev/null 2>&1 && ok "gh installed" \
+      || die "brew install gh failed. Run it yourself, then re-run ./deploy.sh"
   else
-    gh repo create "$REPO_NAME" --public --source=. --remote=origin \
-      --description "Watches for heavily discounted DFW-to-Europe fares" >/dev/null
-    ok "Created public repo $USER/$REPO_NAME"
-    printf "  ${D}public = unlimited free Actions minutes${N}\n"
+    die "Homebrew isn't installed. Get it from https://brew.sh, then re-run this."
   fi
-
-  git push -u origin HEAD >/dev/null 2>&1 && ok "Pushed"
-
-  for v in SERPAPI_KEY SMTP_USER SMTP_PASS ALERT_EMAIL; do
-    val=$(grep -E "^$v=" .env | cut -d= -f2-)
-    printf '%s' "$val" | gh secret set "$v" --repo "$USER/$REPO_NAME" >/dev/null
-    ok "Secret set: $v"
-  done
-
-  gh api -X PUT "repos/$USER/$REPO_NAME/actions/permissions/workflow" \
-    -f default_workflow_permissions=write >/dev/null 2>&1 \
-    && ok "Actions can write (needed to save price history)"
-
-  sec "6/6  First run"
-  gh workflow run scan.yml --repo "$USER/$REPO_NAME" -f dry_run=true >/dev/null 2>&1 \
-    && ok "Triggered a dry run" \
-    || printf "  ${Y}Trigger it yourself: Actions tab -> Run workflow${N}\n"
-  printf "\n  Watch it:  ${B}gh run watch --repo %s/%s${N}\n" "$USER" "$REPO_NAME"
-  printf "  Or open:   https://github.com/%s/%s/actions\n\n" "$USER" "$REPO_NAME"
-  ok "Live. It runs every 4 hours from now on."
-else
-  printf "${Y}!${N} The gh CLI isn't installed or isn't signed in.\n"
-  printf "  ${B}Easiest fix (then re-run this script):${N}\n"
-  printf "    brew install gh && gh auth login\n\n"
-  printf "  ${B}Or do it by hand:${N}\n"
-  printf "   1. Make a PUBLIC repo called %s at https://github.com/new\n" "$REPO_NAME"
-  printf "      ${D}Public matters: private repos get 2,000 Actions minutes/month,\n"
-  printf "      public repos get unlimited. Nothing secret is in the code.${N}\n"
-  printf "   2. Back here:\n"
-  printf "        git remote add origin https://github.com/YOURNAME/%s.git\n" "$REPO_NAME"
-  printf "        git push -u origin HEAD\n"
-  printf "   3. Settings -> Secrets and variables -> Actions -> New secret.\n"
-  printf "      Add these four, names exactly as written:\n"
-  for v in SERPAPI_KEY SMTP_USER SMTP_PASS ALERT_EMAIL; do
-    val=$(grep -E "^$v=" .env | cut -d= -f2-)
-    printf "        %-14s %s…%s ${D}(%d chars — copy from .env)${N}\n" \
-      "$v" "${val:0:4}" "${val: -3}" "${#val}"
-  done
-  printf "   4. Settings -> Actions -> General -> Workflow permissions\n"
-  printf "      -> ${B}Read and write${N}. Without this it can't save price history.\n"
-  printf "   5. Actions tab -> 'Flight deal scan' -> Run workflow -> dry_run: true\n\n"
 fi
+
+if ! gh auth status >/dev/null 2>&1; then
+  printf "\n  ${B}Sign in to GitHub.${N} A browser window will open; approve it\n"
+  printf "  and come back here. This is the only manual step.\n\n"
+  gh auth login -h github.com -p https -w || die "Sign-in didn't complete."
+  ok "Signed in"
+fi
+
+USER=$(gh api user -q .login)
+ok "GitHub user: $USER"
+
+if gh repo view "$USER/$REPO_NAME" >/dev/null 2>&1; then
+  ok "Repo already exists: $USER/$REPO_NAME"
+  git remote get-url origin >/dev/null 2>&1 \
+    || git remote add origin "https://github.com/$USER/$REPO_NAME.git"
+else
+  gh repo create "$REPO_NAME" --public --source=. --remote=origin \
+    --description "Watches for heavily discounted DFW-to-Europe fares" >/dev/null \
+    || die "Couldn't create the repo."
+  ok "Created PUBLIC repo $USER/$REPO_NAME"
+  printf "     ${D}public = unlimited free Actions minutes; nothing secret is in the code${N}\n"
+fi
+
+git push -u origin HEAD >/dev/null 2>&1 && ok "Pushed" || die "Push failed."
+
+for v in SERPAPI_KEY SMTP_USER SMTP_PASS ALERT_EMAIL; do
+  val=$(grep -E "^$v=" .env | cut -d= -f2-)
+  printf '%s' "$val" | gh secret set "$v" --repo "$USER/$REPO_NAME" >/dev/null \
+    && ok "Secret set: $v" || no "Couldn't set $v"
+done
+
+gh api -X PUT "repos/$USER/$REPO_NAME/actions/permissions/workflow" \
+  -f default_workflow_permissions=write >/dev/null 2>&1 \
+  && ok "Actions can write (needed to save price history)" \
+  || no "Couldn't set workflow permissions -- Settings > Actions > General > Read and write"
+
+sec "6/6  First run"
+gh workflow run scan.yml --repo "$USER/$REPO_NAME" -f dry_run=true >/dev/null 2>&1 \
+  && ok "Triggered a dry run (no email will be sent)" \
+  || printf "  ${Y}Trigger it yourself: Actions tab -> Run workflow${N}\n"
+
+printf "\n  Watch it:  ${B}gh run watch --repo %s/%s${N}\n" "$USER" "$REPO_NAME"
+printf "  Or open:   https://github.com/%s/%s/actions\n\n" "$USER" "$REPO_NAME"
+ok "Live. It runs every 4 hours from now on."
+printf "  ${D}Expect silence for a week or two while it learns each route's\n"
+printf "  normal price. If it stops seeing fares at all, it will email you.${N}\n\n"

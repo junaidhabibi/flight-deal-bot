@@ -174,6 +174,13 @@ class DealScorer:
 
         deal.tier = self._tier(deal.discount_pct)
         deal.score = self._priority(deal)
+
+        # score() runs twice for any deal that gets verified -- once before
+        # the Google cross-check and once after -- and both passes append
+        # notes. The result was that the deals given the MOST scrutiny were
+        # the ones whose emails repeated themselves. Order-preserving, so
+        # the first occurrence keeps its position.
+        deal.notes = list(dict.fromkeys(deal.notes))
         return deal
 
     def _set_typical_price(

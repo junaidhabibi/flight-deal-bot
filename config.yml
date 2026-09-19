@@ -231,9 +231,34 @@ trip:
     # Fares from the API report a total journey time but never the layover
     # inside it. The bot estimates it (total duration minus how long the
     # flying should take) and drops fares that land clearly in the dead zone.
-    # The estimate runs high, so it needs this much clearance past the 5h
-    # line before acting -- a routing detour looks like waiting time.
-    estimate_margin_hours: 2.5
+    # How much clearance past the 5h line an ESTIMATE needs before the bot
+    # will throw a fare away.
+    #
+    # Raised 2.5 -> 7.0 on 2026-09-19 after measuring it. The estimate is
+    # total journey time minus expected flying time, where "expected" comes
+    # from the great-circle line between origin and destination. A hub off
+    # that line adds real flying time, and the estimate blames all of it on
+    # the layover. Measured detours:
+    #     DFW-HEL-ARN   +0.8h      DFW-CDG-ARN  +1.6h
+    #     DFW-LHR-ARN   +1.2h      DFW-IST-ARN  +5.0h
+    # So a Turkish routing with a genuine 45-minute connection estimates at
+    # 6.0h, and with a 3h connection at 8.3h -- arithmetically identical to
+    # a direct routing with a 7h wait. No threshold separates them, because
+    # the two cases produce the same number. Turkish fares were in the live
+    # sweep, so this is not hypothetical.
+    #
+    # Which error to prefer is the real question, and it isn't symmetric:
+    # a fare dropped on a bad estimate is INVISIBLE -- it never appears in
+    # any email and nothing records that it was considered. A fare wrongly
+    # kept arrives clearly flagged ("Possible long layover (~8.3h)"), where
+    # it can be checked in one click. So the bot now only discards a fare
+    # when the estimate is past 12h, which no transatlantic detour explains.
+    # Everything between 5h and 12h arrives with the estimate attached.
+    #
+    # Note this applies ONLY to estimated layovers. A stopover the bot built
+    # itself has real departure and arrival times, and the two-band rule is
+    # still enforced exactly on those.
+    estimate_margin_hours: 7.0
     reject_estimated_dead_zone: true
 
   # Reject itineraries with more connections than this (per direction),
@@ -379,6 +404,13 @@ alerts:
   # Don't re-send the same route+price within this window.
   dedupe_hours: 72
   # Don't send more than this many emails per day, no matter what.
+  # If the bot records ZERO fares this many runs in a row, it emails to say
+  # so. Zero on one run is normal; zero for a day means it is not seeing the
+  # data at all -- an expired key, an exhausted quota, or a changed response
+  # format. All of those exit 0 and show a green check, which is how a dead
+  # bot looks exactly like a quiet one. 6 runs is about 24 hours.
+  silence_warning_after_runs: 6
+
   max_emails_per_day: 6
   # Daily digest send time, local (24h). Set to null to disable the digest.
   digest_hour_local: 7
@@ -440,8 +472,10 @@ sources:
     # and a rejected request still costs a search. apply_baggage adds the
     # fee instead, which is the tested path.
     price_with_carry_on: false
-    # One entry per run, cycling. At the 4-hour cron (6 runs/day) this
-    # completes a full lap daily, with Dallas swept 4 times out of 6.
+    # One entry per run, cycling. Seven runs a day against a six-entry
+    # cycle means the lap advances by one slot each day rather than
+    # repeating -- which is fine, and spreads each origin across different
+    # times of day over a week.
     # duration: 2 = about a week away, 3 = about two weeks.
     rotation:
       - {origin: DFW, duration: 2}
@@ -475,16 +509,22 @@ sources:
     # a second opinion on a fare that already looks like a record.
     #
     # NOTE: this shares one key and one 250/month free tier with the Europe
-    # sweep above. The budget below is the TOTAL for both. Sized so that a
-    # worst-case day (6 sweeps + 2 verifications) lands exactly on the cap:
-    #   6 runs/day x 1 sweep  = 6
-    #   + 2 verifications     = 8/day  x 30 = 240/month
+    # sweep above. The budget below is the TOTAL for both.
+    #
+    # The schedule fires SEVEN times a day, not six: "15 */4 * * *" is six
+    # runs (00:15, 04:15 ... 20:15) plus the 12:00 digest. Sized for six,
+    # the daily cap silently swallowed the seventh run's sweep every day.
+    #   7 runs/day x 1 sweep = 7
+    #   + 2 verifications    = 9/day
+    # 9 x 30 = 270, so the MONTHLY cap is the real guard and the last days
+    # of a heavy month lose verifications first -- the right thing to drop,
+    # since the sweep is the only fare source.
     enabled: true
     max_verifications_per_run: 2
     monthly_budget: 240        # stay under the 250 free-tier cap
     # Also capped per day, so the month's allowance can't be spent in the
     # first week. A fare worth verifying is as likely on the 28th as the 2nd.
-    daily_budget: 8
+    daily_budget: 9
 
   rss:
     # Human-curated error-fare feeds. Free, no key, and the fastest signal

@@ -66,11 +66,17 @@ jobs:
           SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
         run: |
+          # SERPAPI_KEY is the only fare source. SMTP_* is how anything
+          # reaches you. ALERT_EMAIL is checked too: without it the code
+          # silently falls back to SMTP_USER, so a typo quietly redirects
+          # every alert to the sending account instead of failing.
           missing=""
           [ -z "$SERPAPI_KEY" ] && missing="$missing SERPAPI_KEY"
           [ -z "$SMTP_USER" ] && missing="$missing SMTP_USER"
           [ -z "$SMTP_PASS" ] && missing="$missing SMTP_PASS"
+          [ -z "$ALERT_EMAIL" ] && missing="$missing ALERT_EMAIL"
           if [ -n "$missing" ]; then
             echo "::error::Missing repository secrets:$missing"
             echo "Add them under Settings -> Secrets and variables -> Actions."
@@ -111,9 +117,40 @@ jobs:
           else
             git commit -m "Price history: $(date -u '+%Y-%m-%d %H:%M UTC')"
             # Another run may have pushed while this one was scanning.
+            #
+            # This loop used to end with `sleep 5`, so when all three
+            # attempts failed its exit status was sleep's -- zero. The step
+            # went green while the run's ENTIRE price history (every
+            # observation, every alert row, every API-usage counter) was
+            # discarded with the ephemeral runner, and the next run
+            # re-spent API calls it had already paid for.
+            #
+            # prices.db is a binary SQLite file, so a concurrent change
+            # cannot auto-merge. A failed rebase must be aborted or every
+            # later attempt dies with "rebase in progress". Ours is the
+            # newer data, so on conflict we keep it.
+            pushed=0
             for i in 1 2 3; do
-              git pull --rebase --autostash && git push && break
+              if git pull --rebase --autostash; then
+                :
+              else
+                echo "Rebase hit a conflict (attempt $i) -- keeping our copy."
+                git checkout --ours data/prices.db 2>/dev/null || true
+                git add data/prices.db 2>/dev/null || true
+                git rebase --continue 2>/dev/null || git rebase --abort || true
+              fi
+              if git push; then
+                pushed=1
+                break
+              fi
               echo "Push attempt $i failed, retrying..."
               sleep 5
             done
+            if [ "$pushed" -ne 1 ]; then
+              echo "::error::Could not push the price history after 3 tries."
+              echo "This run's observations are lost. The next run starts"
+              echo "from the last committed database."
+              exit 1
+            fi
+            echo "Price history pushed."
           fi

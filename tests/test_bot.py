@@ -1806,6 +1806,338 @@ class TestRedaction(unittest.TestCase):
 
 
 # ======================================================================
+#  Regressions from the 2026-09-19 audit.
+#  Every one of these was a bug that left the bot looking healthy.
+# ======================================================================
+
+
+class TestRSSLifecycle(unittest.TestCase):
+    """RSS items used to be marked seen on FETCH, so an item found by a
+    non-digest run (6 of every 7) was recorded, never sent, then filtered
+    out of the digest that would have sent it. Destroyed silently."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SERPAPI_KEY"] = "fake-key"
+        self.cfg = Config.load(Path(__file__).resolve().parents[1] / "config.yml")
+        self.cfg._d["storage"]["db_path"] = f"{self.tmp.name}/rss.db"
+        from bot.main import FlightDealBot
+        self.bot = FlightDealBot(self.cfg, dry_run=True)
+        self.sent = []
+        self.bot.emailer.send_deals = (
+            lambda deals=(), urgent=False, rss_items=(), max_deals=12:
+            self.sent.append(list(rss_items)) or True
+        )
+
+    def tearDown(self):
+        self.bot.close(); self.tmp.cleanup()
+        os.environ.pop("SERPAPI_KEY", None)
+
+    def _item(self, guid, hot):
+        from bot.sources.rss_deals import FeedItem
+        i = FeedItem(guid=guid, title=f"deal {guid}", link="http://x/" + guid,
+                     summary="", published=None)
+        i.is_hot = hot
+        return i
+
+    def test_an_unsent_item_is_not_marked_seen(self):
+        cold = self._item("cold-1", hot=False)
+        self.bot.dispatch([], [cold], send_digest=False)
+        self.assertFalse(
+            self.bot.hist.rss_seen("cold-1"),
+            "item was buried without ever being emailed",
+        )
+
+    def test_a_sent_item_is_marked_seen(self):
+        hot = self._item("hot-1", hot=True)
+        self.bot.dispatch([], [hot], send_digest=False)
+        self.assertTrue(self.bot.hist.rss_seen("hot-1"))
+
+    def test_a_held_item_still_reaches_the_digest(self):
+        cold = self._item("cold-2", hot=False)
+        self.bot.dispatch([], [cold], send_digest=False)
+        self.assertFalse(self.bot.hist.rss_seen("cold-2"))
+        self.bot.dispatch([], [cold], send_digest=True)
+        self.assertTrue(self.bot.hist.rss_seen("cold-2"))
+        self.assertIn(cold, self.sent[-1])
+
+    def test_a_hot_item_is_not_skipped_just_because_a_deal_also_fired(self):
+        """It used to require `not urgent`, and was already marked seen."""
+        hot = self._item("hot-2", hot=True)
+        self.bot.dispatch([], [hot], send_digest=False)
+        self.assertTrue(self.bot.hist.rss_seen("hot-2"))
+
+
+class TestDailyEmailCapCountsEmails(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.hist = History(f"{self.tmp.name}/cap.db")
+
+    def tearDown(self):
+        self.hist.close(); self.tmp.cleanup()
+
+    def test_one_email_of_seven_deals_counts_as_one(self):
+        # Seven DIFFERENT routes: record_alert keys on the fingerprint, so
+        # the same route seven times is one row, not seven.
+        for i, dest in enumerate(
+            ("ARN", "CPH", "OSL", "DUB", "LIS", "MXP", "ZRH")
+        ):
+            self.hist.record_alert(Deal(
+                origin="DFW", destination=dest, destination_city=dest,
+                price_usd=400 + i, depart_date=date(2027, 1, 10),
+                return_date=date(2027, 1, 20),
+            ))
+        self.assertEqual(self.hist.alerts_sent_since(24), 7)
+        self.assertEqual(
+            self.hist.emails_sent_since(24), 1,
+            "7 deals in one email counted as 7 emails and gagged the bot",
+        )
+
+
+class TestUnknownStopCount(unittest.TestCase):
+    """A missing stop count became 0, and 0 short-circuits the whole layover
+    rule as 'nonstop -- no layover'."""
+
+    def _deal(self, row):
+        from bot.sources.google_deals import GoogleTravelExplore
+        base = {"destination_airport": {"code": "ARN"}, "name": "Stockholm",
+                "flight_price": 500, "start_date": "2026-11-08",
+                "end_date": "2026-11-18", "airline_code": "AY",
+                "flight_duration": 825}
+        base.update(row)
+        return GoogleTravelExplore.to_deal(base, "DFW", {"ARN": "Stockholm"})
+
+    def test_missing_field_is_unknown_not_nonstop(self):
+        d = self._deal({})
+        self.assertIsNone(d.legs[0].stops)
+
+    def test_garbage_is_unknown_not_nonstop(self):
+        self.assertIsNone(self._deal({"number_of_stops": "1 stop"}).legs[0].stops)
+
+    def test_a_real_zero_is_still_nonstop(self):
+        self.assertEqual(self._deal({"number_of_stops": 0}).legs[0].stops, 0)
+
+    def test_unknown_transfers_is_not_treated_as_nonstop(self):
+        est = assess_api_layover("DFW", "ARN", total_minutes=825,
+                                 transfers=None, rules=LayoverRules())
+        self.assertIsNone(est.band)
+        self.assertFalse(est.confident)
+        self.assertNotIn("nonstop", est.reason)
+
+
+class TestTooLongLayoverIsRejected(unittest.TestCase):
+    def test_an_absurd_estimate_is_known_bad(self):
+        """Also what a seconds-vs-minutes units change looks like."""
+        est = assess_api_layover("DFW", "ARN", total_minutes=33300 * 60,
+                                 transfers=1, rules=LayoverRules())
+        self.assertEqual(est.band, TOO_LONG)
+        self.assertTrue(est.is_known_bad, "a 500h layover was kept and emailed")
+
+    def test_a_normal_connection_is_still_fine(self):
+        est = assess_api_layover("DFW", "ARN", total_minutes=825,
+                                 transfers=1, rules=LayoverRules())
+        self.assertFalse(est.is_known_bad)
+
+
+class TestEmailNeverClaimsFalseNonstop(unittest.TestCase):
+    """The estimator clamps a negative excess to 0.0 and its expected flight
+    time is deliberately generous, so a 1-stop fare landing on 0.0 hours is
+    routine. The email called it a nonstop."""
+
+    def _render(self, stops):
+        from bot.emailer import Emailer
+        d = Deal(origin="DFW", destination="ARN", destination_city="Stockholm",
+                 price_usd=500, depart_date=date(2027, 1, 10),
+                 return_date=date(2027, 1, 20),
+                 legs=[Leg("DFW", "ARN", datetime(2027, 1, 10, 17, 0),
+                           stops=stops)])
+        d.layover_band = "quick"
+        d.layover_hours = 0.0
+        d.reference_price = 700.0
+        d.discount_pct = 28.0
+        e = Emailer(smtp_host="x", smtp_port=1, username="u", password="",
+                    to_address="t@example.com", dry_run=True)
+        return e._text_body([d], [], urgent=True), e._html_body([d], [], urgent=True)
+
+    def test_a_connection_is_not_called_nonstop(self):
+        text, html = self._render(stops=1)
+        self.assertNotIn("none -- nonstop", text)
+        self.assertNotIn("nonstop", html)
+        self.assertIn("CHECK BEFORE BOOKING", text)
+
+    def test_a_real_nonstop_still_says_nonstop(self):
+        text, _ = self._render(stops=0)
+        self.assertIn("none -- nonstop", text)
+
+
+class TestRotationBudgetGuard(unittest.TestCase):
+    def test_zero_budget_scans_nothing(self):
+        from bot.main import FlightDealBot
+        tmp = tempfile.TemporaryDirectory()
+        cfg = Config.load(Path(__file__).resolve().parents[1] / "config.yml")
+        cfg._d["storage"]["db_path"] = f"{tmp.name}/rot2.db"
+        bot = FlightDealBot(cfg, dry_run=True)
+        try:
+            self.assertEqual(
+                bot._rotating_slice(list("ABCDEFGHIJ"), 0), [],
+                "'no budget' returned the entire list",
+            )
+        finally:
+            bot.close(); tmp.cleanup()
+
+
+class TestLowercaseAirlineCode(unittest.TestCase):
+    def test_lowercase_code_is_still_a_known_airline(self):
+        advisor = BaggageAdvisor(FREEFORM)
+        upper = advisor.assess(["SK"], segments=2)
+        lower = advisor.assess(["sk"], segments=2)
+        self.assertEqual(lower.fee_usd, upper.fee_usd)
+        self.assertFalse(
+            lower.unknown_bag_carriers,
+            "named the airline and then said it was unidentified",
+        )
+
+
+
+class TestSilenceDetector(unittest.TestCase):
+    """The dangerous failure is a shrug, not a crash. If Explore starts
+    returning an empty list, every run logs "0 fares", exits 0, and shows a
+    green check forever. Nobody reads the logs of a passing job."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SERPAPI_KEY"] = "fake-key"
+        self.cfg = Config.load(Path(__file__).resolve().parents[1] / "config.yml")
+        self.cfg._d["storage"]["db_path"] = f"{self.tmp.name}/quiet.db"
+        from bot.main import FlightDealBot
+        self.bot = FlightDealBot(self.cfg, dry_run=True)
+        self.warnings = []
+        self.bot.emailer.send = (
+            lambda subject, text, html="":
+            self.warnings.append(subject) or True
+        )
+
+    def tearDown(self):
+        self.bot.close(); self.tmp.cleanup()
+        os.environ.pop("SERPAPI_KEY", None)
+
+    def _finished_run(self, observations):
+        rid = self.bot.hist.start_run()
+        self.bot.hist.finish_run(rid, observations=observations,
+                                 candidates=0, alerts_sent=0, errors=[])
+
+    def test_one_empty_run_is_not_worth_an_email(self):
+        self.bot._check_for_silence(0)
+        self.assertEqual(self.warnings, [])
+
+    def test_a_run_that_found_something_never_warns(self):
+        for _ in range(20):
+            self._finished_run(0)
+        self.bot._check_for_silence(5)
+        self.assertEqual(self.warnings, [])
+
+    def test_a_full_day_of_nothing_sends_a_warning(self):
+        threshold = int(self.cfg.alerts.get("silence_warning_after_runs", 6))
+        for _ in range(threshold - 1):
+            self._finished_run(0)
+        self.bot._check_for_silence(0)
+        self.assertEqual(len(self.warnings), 1, "the bot went dark quietly")
+        self.assertIn("stopped finding fares", self.warnings[0])
+
+    def test_it_does_not_nag_on_every_run(self):
+        threshold = int(self.cfg.alerts.get("silence_warning_after_runs", 6))
+        for _ in range(threshold - 1):
+            self._finished_run(0)
+        self.bot._check_for_silence(0)      # fires at the threshold
+        self._finished_run(0)
+        self.bot._check_for_silence(0)      # one past it
+        self.assertEqual(len(self.warnings), 1)
+
+    def test_a_recent_success_resets_the_streak(self):
+        threshold = int(self.cfg.alerts.get("silence_warning_after_runs", 6))
+        self._finished_run(20)
+        for _ in range(threshold - 2):
+            self._finished_run(0)
+        self.bot._check_for_silence(0)
+        self.assertEqual(self.warnings, [])
+
+
+class TestExitCodeIsHonest(unittest.TestCase):
+    def test_errors_are_not_masked_by_a_sent_email(self):
+        """It used to return 0 whenever anything had been emailed, so a run
+        where the only fare source 401'd still showed a green check."""
+        import inspect
+        from bot import main as m
+        src = inspect.getsource(m.main)
+        self.assertIn("return 1 if bot.errors else 0", src)
+        self.assertNotIn("0 if not bot.errors else 0 if sent else 1", src)
+
+
+
+class TestDetourVersusLayover(unittest.TestCase):
+    """The estimate is total time minus great-circle flying time, so a hub
+    off the direct line looks exactly like waiting. Measured: Istanbul adds
+    5.0h of real flying to DFW->ARN. Dropping on that is invisible to the
+    reader; keeping and flagging is not."""
+
+    def setUp(self):
+        self.cfg = Config.load(Path(__file__).resolve().parents[1] / "config.yml")
+        self.rules = self.cfg.layover_rules
+        self.margin = float(self.cfg.layover.get("estimate_margin_hours", 2.5))
+
+    def _verdict(self, hub, dest, connection_h, origin="DFW"):
+        from bot.layovers import expected_flight_minutes
+        total = (expected_flight_minutes(origin, hub)
+                 + expected_flight_minutes(hub, dest)
+                 + connection_h * 60)
+        return assess_api_layover(origin, dest, total_minutes=total,
+                                  transfers=1, rules=self.rules,
+                                  margin_hours=self.margin)
+
+    def test_a_big_detour_with_a_short_connection_is_not_discarded(self):
+        for conn in (0.75, 3, 5):
+            est = self._verdict("IST", "ARN", conn)
+            self.assertFalse(
+                est.is_known_bad,
+                f"Istanbul routing with a real {conn}h connection was thrown "
+                f"away on a {est.hours:.1f}h estimate the reader never sees",
+            )
+
+    def test_normal_hubs_with_quick_connections_are_not_even_flagged(self):
+        for hub in ("HEL", "LHR", "CDG", "KEF"):
+            est = self._verdict(hub, "ARN", 1)
+            self.assertFalse(est.is_known_bad)
+            self.assertEqual(est.band, QUICK, f"{hub} flagged for a 1h connection")
+
+    def test_an_estimate_no_detour_can_explain_is_still_discarded(self):
+        est = self._verdict("HEL", "ARN", 14)
+        self.assertTrue(est.is_known_bad)
+
+    def test_a_kept_but_uncertain_fare_carries_the_number(self):
+        est = self._verdict("IST", "ARN", 3)
+        self.assertIsNotNone(est.hours)
+        self.assertIn("estimated", est.reason)
+
+    def test_built_stopovers_are_still_judged_exactly(self):
+        """The margin loosens ESTIMATES only. A stopover the bot built has
+        real times, and the two-band rule is enforced on those unchanged."""
+        from bot.stopovers import verify_layover_rule
+        d = Deal(origin="DFW", destination="ARN", destination_city="Stockholm",
+                 price_usd=500, depart_date=date(2026, 11, 2),
+                 return_date=date(2026, 11, 14),
+                 stopover_code="HEL", stopover_city="Helsinki",
+                 stopover_hours=8,
+                 legs=[Leg("DFW", "HEL", datetime(2026, 11, 2, 17, 0)),
+                       Leg("HEL", "ARN", datetime(2026, 11, 3, 14, 0)),
+                       Leg("ARN", "DFW", datetime(2026, 11, 14, 8, 0))])
+        self.assertFalse(
+            verify_layover_rule(d, self.rules),
+            "an 8h built stopover is squarely in the dead zone",
+        )
+
+
+
+# ======================================================================
 #  NOTE: this block must stay at the very END of the file.
 #
 #  It used to sit mid-file, and `python -m tests.test_bot` -- which is how
