@@ -1,0 +1,10 @@
+setup.sh: fix helper function shadowing the head command, which corrupted every saved credential
+
+A function named head() shadowed /usr/bin/head, so 'grep ... | head -1'
+in existing() called the function with argument -1 and returned '-1' as
+the saved value for every field. That then overwrote a working .env.
+
+- Rename all helpers with a _ prefix so none can shadow a real command
+- Read .env with shell builtins only, so there is nothing left to shadow
+- Back up .env before rewriting it
+- Refuse to save multi-line or dash-leading values

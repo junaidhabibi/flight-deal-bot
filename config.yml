@@ -1,0 +1,524 @@
+# ============================================================
+#  Flight Deal Bot — configuration
+#  Everything you'd want to tune lives in this file.
+# ============================================================
+
+# ---------- Where you fly from ----------
+origins:
+  # Your home airport. Listed first = preferred.
+  - code: DFW
+    name: "Dallas/Fort Worth"
+    weight: 1.00      # no penalty
+  # NOTE: Dallas Love Field (DAL) is deliberately NOT here. It has no
+  # international service at all -- 98% Southwest, entirely domestic -- so
+  # every DAL->Europe query is a guaranteed zero. It was in an earlier
+  # version and burned about two-thirds of each run's request budget on
+  # routes that cannot exist.
+  #
+  # Cheap one-hour hops / short drives you'd tolerate for a great fare.
+  - code: AUS
+    name: "Austin"
+    weight: 0.92
+  - code: IAH
+    name: "Houston Intercontinental"
+    weight: 0.90
+  - code: ORD
+    name: "Chicago O'Hare"
+    weight: 0.80      # only worth it if the fare is spectacular
+
+# ---------- Where you want to go ----------
+# baseline_usd = what a normal-but-good round-trip economy fare costs from DFW,
+# ALL-IN (fare + carry-on fee). The bot uses this only until it has collected
+# its own price history, after which real observations take over.
+# RECALIBRATED 2026-09-19 from a real Google Travel Explore sweep of DFW ->
+# all of Europe (two searches, ~48 destinations each, covering Oct'26-Feb'27).
+# Every baseline marked "observed" is that route's CHEAPEST fare anywhere in
+# that window, multiplied by 1.12 to represent a normal-but-good fare rather
+# than the floor. The ones marked ESTIMATE were not returned by Explore.
+#
+# Why this mattered: the previous numbers were guesses, and several were below
+# the real floor -- Reykjavik was set to $520 against a true floor of $728, so
+# it could never have produced an alert no matter how good the fare got.
+#
+# Caveat: Explore reports the fare only. The bot adds carry-on fees to fares it
+# finds, so a found price is compared slightly unfavourably against these. That
+# errs toward silence rather than false alarms, and the bot's own price history
+# supersedes these numbers within a few weeks anyway.
+destinations:
+  - code: ARN
+    city: "Stockholm"
+    country: "Sweden"
+    priority: 2.00          # <-- your stated #1. Scores get multiplied by this.
+    baseline_usd: 635       # floor $567 x1.12 (observed 2026-09-19)
+  - code: GOT
+    city: "Gothenburg"
+    country: "Sweden"
+    priority: 1.35
+    baseline_usd: 715       # ESTIMATE -- est. from ARN 567 + typical Gothenburg premium
+  - code: CPH
+    city: "Copenhagen"
+    country: "Denmark"
+    priority: 1.30          # 5h train / 35min flight to Stockholm
+    baseline_usd: 675       # floor $601 x1.12 (observed 2026-09-19)
+  - code: OSL
+    city: "Oslo"
+    country: "Norway"
+    priority: 1.25
+    baseline_usd: 730       # floor $650 x1.12 (observed 2026-09-19)
+  - code: HEL
+    city: "Helsinki"
+    country: "Finland"
+    priority: 1.20
+    baseline_usd: 885       # floor $789 x1.12 (observed 2026-09-19)
+  - code: KEF
+    city: "Reykjavik"
+    country: "Iceland"
+    priority: 1.10
+    baseline_usd: 815       # floor $728 x1.12 (observed 2026-09-19)
+  - code: LHR
+    city: "London"
+    country: "UK"
+    priority: 1.00
+    baseline_usd: 875       # floor $782 x1.12 (observed 2026-09-19)
+  - code: DUB
+    city: "Dublin"
+    country: "Ireland"
+    priority: 1.00
+    baseline_usd: 595       # floor $533 x1.12 (observed 2026-09-19)
+  - code: CDG
+    city: "Paris"
+    country: "France"
+    priority: 1.00
+    baseline_usd: 695       # floor $621 x1.12 (observed 2026-09-19)
+  - code: AMS
+    city: "Amsterdam"
+    country: "Netherlands"
+    priority: 1.00
+    baseline_usd: 705       # floor $630 x1.12 (observed 2026-09-19)
+  - code: FRA
+    city: "Frankfurt"
+    country: "Germany"
+    priority: 1.00
+    baseline_usd: 690       # ESTIMATE -- est. from BER 616 / MUC 657
+  - code: BER
+    city: "Berlin"
+    country: "Germany"
+    priority: 1.00
+    baseline_usd: 690       # floor $616 x1.12 (observed 2026-09-19)
+  - code: MAD
+    city: "Madrid"
+    country: "Spain"
+    priority: 1.00
+    baseline_usd: 680       # floor $609 x1.12 (observed 2026-09-19)
+  - code: BCN
+    city: "Barcelona"
+    country: "Spain"
+    priority: 1.00
+    baseline_usd: 690       # floor $615 x1.12 (observed 2026-09-19)
+  - code: LIS
+    city: "Lisbon"
+    country: "Portugal"
+    priority: 1.00
+    baseline_usd: 645       # floor $575 x1.12 (observed 2026-09-19)
+  - code: FCO
+    city: "Rome"
+    country: "Italy"
+    priority: 1.00
+    baseline_usd: 680       # floor $606 x1.12 (observed 2026-09-19)
+  - code: MXP
+    city: "Milan"
+    country: "Italy"
+    priority: 1.00
+    baseline_usd: 640       # floor $570 x1.12 (observed 2026-09-19)
+  - code: IST
+    city: "Istanbul"
+    country: "Turkey"
+    priority: 0.95
+    baseline_usd: 720       # ESTIMATE -- not returned by Explore; left at previous guess
+  - code: ATH
+    city: "Athens"
+    country: "Greece"
+    priority: 0.95
+    baseline_usd: 745       # floor $665 x1.12 (observed 2026-09-19)
+  - code: PRG
+    city: "Prague"
+    country: "Czechia"
+    priority: 1.00
+    baseline_usd: 680       # floor $607 x1.12 (observed 2026-09-19)
+  - code: VIE
+    city: "Vienna"
+    country: "Austria"
+    priority: 1.00
+    baseline_usd: 715       # floor $640 x1.12 (observed 2026-09-19)
+  - code: ZRH
+    city: "Zurich"
+    country: "Switzerland"
+    priority: 0.95
+    baseline_usd: 635       # floor $567 x1.12 (observed 2026-09-19)
+  - code: WAW
+    city: "Warsaw"
+    country: "Poland"
+    priority: 1.00
+    baseline_usd: 790       # ESTIMATE -- est. from KRK 707
+  - code: BUD
+    city: "Budapest"
+    country: "Hungary"
+    priority: 1.00
+    baseline_usd: 730       # floor $650 x1.12 (observed 2026-09-19)
+
+# ---------- Stopover cities you'd happily spend a day or two in ----------
+# The bot stitches ORIGIN -> HUB -> DESTINATION and *requires* the gap between
+# the two flights to fall inside layover_hours below. Nothing shorter gets
+# through, so you never get a 90-minute connection.
+stopover_hubs:
+  - {code: KEF, city: "Reykjavik",  country: "Iceland",     appeal: 1.30}
+  - {code: HEL, city: "Helsinki",   country: "Finland",     appeal: 1.25}
+  - {code: CPH, city: "Copenhagen", country: "Denmark",     appeal: 1.25}
+  - {code: DUB, city: "Dublin",     country: "Ireland",     appeal: 1.20}
+  - {code: LIS, city: "Lisbon",     country: "Portugal",    appeal: 1.20}
+  - {code: AMS, city: "Amsterdam",  country: "Netherlands", appeal: 1.15}
+  - {code: IST, city: "Istanbul",   country: "Turkey",      appeal: 1.15}
+  - {code: LHR, city: "London",     country: "UK",          appeal: 1.10}
+  - {code: CDG, city: "Paris",      country: "France",      appeal: 1.10}
+  - {code: MAD, city: "Madrid",     country: "Spain",       appeal: 1.10}
+  - {code: BCN, city: "Barcelona",  country: "Spain",       appeal: 1.10}
+  - {code: OSL, city: "Oslo",       country: "Norway",      appeal: 1.05}
+  - {code: FRA, city: "Frankfurt",  country: "Germany",     appeal: 0.95}
+  - {code: MUC, city: "Munich",     country: "Germany",     appeal: 1.00}
+  - {code: ZRH, city: "Zurich",     country: "Switzerland", appeal: 1.00}
+  - {code: VIE, city: "Vienna",     country: "Austria",     appeal: 1.05}
+  - {code: BRU, city: "Brussels",   country: "Belgium",     appeal: 1.00}
+  - {code: WAW, city: "Warsaw",     country: "Poland",      appeal: 1.00}
+
+# ---------- Trip shape ----------
+trip:
+  # How far ahead to scan. Dates are open/flexible, so this is wide.
+  search_months_ahead: 11
+  search_months_start: 1          # skip the next 30 days (fares are never good)
+
+  # Nights at the final destination (excludes stopover time).
+  min_nights: 5
+  max_nights: 21
+
+  # THE LAYOVER RULE. Two acceptable shapes, with a gap between them:
+  #
+  #   0 - 5h      QUICK      a normal connection. Fine.
+  #   5 - 14h     DEAD ZONE  rejected. Too long to sit in a terminal, too
+  #                          short to be worth a hotel and seeing anything.
+  #   14 - 24h    DEPENDS    a stopover only if it actually spans a night.
+  #                          18:00 -> 08:00 is a hotel, a dinner and a
+  #                          morning. 08:00 -> 22:00 is the same 14 hours
+  #                          spent dragging a suitcase around. Same number,
+  #                          completely different trip -- so the clock times
+  #                          decide, not the duration.
+  #   24 - 120h   STOPOVER   a real stay. Sleep there, see the city, fly on.
+  #   over 120h              that's two trips, not a stopover.
+  #
+  # The dead zone is the point of this. A 9-hour layover in Frankfurt is the
+  # worst thing a cheap fare can hide, and price-sorted search hands them out
+  # constantly.
+  layover:
+    quick_max_hours: 5        # a connection this short needs no overnight
+    overnight_min_hours: 14   # shortest gap that can count as a night
+    overnight_max_hours: 120  # 5 days max in the stopover city
+
+    # Under this many hours, the gap must cover the quiet hours below to
+    # count as an overnight. Above it, a night is guaranteed regardless.
+    require_night_below_hours: 24
+    night_core_start: 1       # 01:00 local, at the STOPOVER city
+    night_core_end: 6         # 06:00 local
+
+    # Fares from the API report a total journey time but never the layover
+    # inside it. The bot estimates it (total duration minus how long the
+    # flying should take) and drops fares that land clearly in the dead zone.
+    # The estimate runs high, so it needs this much clearance past the 5h
+    # line before acting -- a routing detour looks like waiting time.
+    estimate_margin_hours: 2.5
+    reject_estimated_dead_zone: true
+
+  # Reject itineraries with more connections than this (per direction),
+  # not counting the intentional long stopover.
+  max_extra_stops: 1
+
+  cabin: economy
+  passengers: 1
+  currency: USD
+
+# ---------- Your carry-on ----------
+# Samsonite Freeform Carry-On Spinner. Dimensions are the OVERALL figures
+# from Samsonite (23" H x 15" L x 10" W), which is what airlines measure --
+# their sizers include wheels and handles.
+#
+# The bag is over the PUBLISHED limit everywhere (58.4 x 38.1 x 25.4 cm vs a
+# 55x40x23 European standard), but published limits are not what happens at
+# the gate. The bot rates risk by ENFORCEMENT, from traveler reports:
+#
+#   AA / DL / UA          lenient   -> low risk, matches real-world experience
+#   British Airways, KLM  lenient   -> low risk
+#   Finnair, Lufthansa    lenient on size, but weigh sometimes
+#   SAS                   weighs bags routinely, even in SAS Plus
+#   Ryanair, Eurowings,   sizer at every gate
+#   Wizz, Aer Lingus
+#
+# The practical conclusion: SIZE is rarely the problem on a transatlantic
+# leg. WEIGHT on Nordic carriers, and the strict low-cost airlines that fly
+# the intra-Europe stopover hops, are where this bag actually gets caught.
+# See `python -m bot.main --bag` for the current table.
+carry_on:
+  name: "Samsonite Freeform Carry-On Spinner"
+  # Overall external dimensions, inches, including wheels and handle.
+  height_in: 23
+  width_in: 15
+  depth_in: 10
+  weight_lb: 6.5
+  expandable_in: 1        # never expand it at the gate
+
+  # Roughly what you pack, in lb (contents only, bag excluded). This is what
+  # drives the weight-risk warnings. Set to null to skip weight checks.
+  # 15 lb packed + 6.5 lb bag = 9.8 kg, over Finnair/SAS's 8 kg cabin cap.
+  packed_weight_lb: 15
+
+  # Fare estimate to add a cabin bag when the cheapest fare excludes one.
+  # Used for airlines not in bot/baggage.py's table.
+  assume_fee_usd: 45
+
+  # Override the built-in per-airline estimates as you learn real numbers.
+  # Keys are IATA airline codes.
+  fee_overrides: {}
+    # AY: 55          # Finnair
+    # SK: 40          # SAS
+
+  # Force "cheapest fare includes a cabin bag" true/false for an airline.
+  included_overrides: {}
+    # AY: false
+
+# ---------- What counts as "heavily discounted" ----------
+# The bot computes a discount vs. the lowest credible reference price it has.
+# You said you mean it, so the floor is deliberately aggressive.
+thresholds:
+  # Absolute hard ceiling. Nothing above this is ever emailed, full stop.
+  # NOTE: all prices below are ALL-IN -- fare plus carry-on fees. On a
+  # separate-ticket stopover that means a bag fee per ticket, which is
+  # exactly the cost that makes a cheap-looking stopover not cheap.
+  # Set by Junaid 2026-09-19: "deal-shaped, not bargain-only". The most he'd
+  # actually pay for a European round trip, all-in with the carry-on.
+  #
+  # History: this was 499, which was 18% BELOW the cheapest DFW->ARN fare
+  # available anywhere in the next six months. Combined with the old 35%
+  # discount gate the bot could only ever have fired at $422 -- i.e. never.
+  #
+  # At 625 this ceiling binds on only three destinations (Helsinki, Reykjavik,
+  # London), whose floors are $728-789 and which therefore only reach the inbox
+  # in a real sale. Everywhere else the discount tiers below decide.
+  max_price_usd: 625
+
+  # Drop fares outright when the bag is badly oversize for that carrier
+  # (>2cm over). Off by default: you may be happy to gate-check for a
+  # $250 fare. Turn on if you never want to risk it.
+  skip_oversize_bag_routes: false
+
+  # Day one, the bot has no price history, so nothing can be a "record" and
+  # require_record below would drop everything. This is the escape hatch: a
+  # fare at this tier or better alerts anyway, on the strength of its
+  # discount alone, while history is still being built.
+  #
+  # Was effectively "insane" (45% off, $358 to Stockholm) until 2026-09-19,
+  # when a rehearsal showed a genuine 28%-off Stockholm fare being dropped
+  # for having no history to beat. "great" is 32% off -- rare enough not to
+  # be noise, reachable enough to actually fire.
+  # The origin every baseline_usd above was measured from. A fare from any
+  # OTHER origin gets no baseline and must build its own price history first.
+  #
+  # Added 2026-09-19 after the first live run scored a routine ORD->Reykjavik
+  # fare at "40% off" by measuring it against a Dallas baseline. Chicago has
+  # an Icelandair nonstop; Dallas doesn't. $393 is Chicago's ordinary winter
+  # price -- identical on two different weeks -- not a deal.
+  baseline_origin: DFW
+
+  no_history_alert_tier: great
+
+  # Minimum discount vs. the route's reference price, to alert at all.
+  # Recalibrated 2026-09-19. Observed reality: DFW->ARN bottoms out at $608
+  # against a $650 baseline -- only 6% below it. A 35% gate ($422) is not a
+  # "rare deal", it is an impossibility. 18% ($533 for ARN) is roughly 14%
+  # under the six-month floor: rare, but a real sale or error fare reaches it.
+  min_discount_pct: 18
+
+  # Tier boundaries (discount % vs reference price).
+  # What each tier means in dollars for Stockholm (baseline $650):
+  #   watch  18% -> $533   logged only
+  #   good   25% -> $488   daily digest
+  #   great  32% -> $442   instant email
+  #   insane 45% -> $358   instant email, flagged as probable error fare
+  # For reference, the cheapest ARN fare on sale anywhere Oct'26-Mar'27 is $608.
+  tiers:
+    watch:    18      # logged, not emailed on its own
+    good:     25      # emailed in the daily digest
+    great:    32      # emailed immediately
+    insane:   45      # emailed immediately, flagged as probable error fare
+
+  # Only email immediately for >= this tier. Everything else waits for
+  # the daily digest so you aren't pinged all day.
+  instant_alert_tier: great
+
+  # A fare is a RECORD if it is at or below every price the bot has ever
+  # recorded for that route. record_tolerance_pct lets a near-tie count.
+  record_tolerance_pct: 2.0
+
+  # Require a record (or near-record) before emailing, regardless of tier.
+  # This is the "as low or lower than it has ever been" rule. Set false if
+  # you want good-but-not-record fares too.
+  require_record: true
+
+  # Until the bot has this many observations for a route, it leans on
+  # baseline_usd from the destination list instead of its own history.
+  min_observations_for_history: 8
+
+# ---------- Alerting ----------
+alerts:
+  # Don't re-send the same route+price within this window.
+  dedupe_hours: 72
+  # Don't send more than this many emails per day, no matter what.
+  max_emails_per_day: 6
+  # Daily digest send time, local (24h). Set to null to disable the digest.
+  digest_hour_local: 7
+  timezone: "America/Chicago"
+  # Max deals listed in one email.
+  max_deals_per_email: 12
+
+# ---------- Scan budget ----------
+# A full sweep of every origin x destination x month is ~3,000 API requests
+# and about 25 minutes. That's fine for the fare API (it's free), but a
+# GitHub Actions private repo only gets 2,000 free minutes a month -- 13 runs
+# a day at 25 minutes would burn the month's quota in under a week.
+#
+# So each run scans a SLICE and rotates through the rest. Your priority
+# destinations get scanned every single run; everything else cycles, and
+# covers the full list several times a day anyway.
+#
+# Note: if you make the repo PUBLIC, GitHub Actions minutes are unlimited and
+# free, and you can raise these caps as high as you like.
+scan:
+  # Roughly how many API requests one run may make. ~120 requests/minute in
+  # practice, so 600 is about a 5-minute run.
+  max_requests_per_run: 600
+
+  # Destinations at or above this priority are scanned on EVERY run, never
+  # rotated out. Stockholm is 2.00, so it's always watched.
+  always_scan_priority_above: 1.2
+
+  # Origins to include in the rotating sweep. The first N are always used.
+  always_scan_origins: 2
+
+  # Share of the budget given to stopover-building (the rest goes to
+  # ordinary round trips).
+  stopover_budget_share: 0.45
+
+  # Months of the search window covered per run for stopovers. Rotates.
+  stopover_months_per_run: 5
+
+# ---------- Data sources ----------
+sources:
+  # ---- PRIMARY FARE SOURCE ----
+  # Google Travel Explore, via SerpApi. One request asks "what's cheap from
+  # DFW to anywhere in Europe?" and returns ~48 destinations, each with its
+  # own cheapest date pair. Verified working 2026-09-19: 48 European cities,
+  # 20 of them on the list above, in a single call.
+  #
+  # That per-request yield is the whole design. A 250-request monthly budget
+  # buys 250 route-month lookups, which is nothing; it buys 250 sweeps of an
+  # entire continent, which is plenty.
+  google_explore:
+    enabled: true
+    area_id: "/m/02j9z"          # Europe, as a Google Knowledge Graph ID
+    calls_per_run: 1
+    # Held back from the daily budget so verification isn't starved by the
+    # sweep. See _serpapi_room in main.py.
+    reserve_for_verification: 2
+    # Ask the engine to price the carry-on in directly. OFF: the `bags`
+    # parameter is documented but not yet verified against the live engine,
+    # and a rejected request still costs a search. apply_baggage adds the
+    # fee instead, which is the tested path.
+    price_with_carry_on: false
+    # One entry per run, cycling. At the 4-hour cron (6 runs/day) this
+    # completes a full lap daily, with Dallas swept 4 times out of 6.
+    # duration: 2 = about a week away, 3 = about two weeks.
+    rotation:
+      - {origin: DFW, duration: 2}
+      - {origin: DFW, duration: 3}
+      - {origin: DFW, duration: 2}
+      - {origin: ORD, duration: 3}   # much cheaper to Europe; worth a look
+      - {origin: DFW, duration: 3}
+      - {origin: AUS, duration: 2}
+
+  travelpayouts:
+    # DISABLED 2026-09-19, after diagnosis rather than a guess.
+    #
+    # This endpoint does not search; it serves a cache of fares that Aviasales
+    # users happened to look up in the last 48 hours. Diagnostics showed the
+    # cache is simply empty for these routes: DFW->ARN returned zero fares on
+    # every market, every month, one-way and round-trip, and under both the
+    # airport and the city code. The control queries worked fine (JFK->LON
+    # returned 13 fares), so it wasn't the token or the client. Asking DFW for
+    # everything it had cached returned 30 destinations, all of them domestic.
+    #
+    # Left in place rather than deleted: the code is tested and costs nothing
+    # while disabled, and the cache may well have depth from a different
+    # origin someday. But it is not a source for Dallas to Europe.
+    enabled: false
+    market: us
+    # Pause between calls. v3 endpoints allow 600/min; this is well under.
+    request_delay_seconds: 0.15
+
+  serpapi:
+    # The verifier -- Google's own typical_price_range and price_history, as
+    # a second opinion on a fare that already looks like a record.
+    #
+    # NOTE: this shares one key and one 250/month free tier with the Europe
+    # sweep above. The budget below is the TOTAL for both. Sized so that a
+    # worst-case day (6 sweeps + 2 verifications) lands exactly on the cap:
+    #   6 runs/day x 1 sweep  = 6
+    #   + 2 verifications     = 8/day  x 30 = 240/month
+    enabled: true
+    max_verifications_per_run: 2
+    monthly_budget: 240        # stay under the 250 free-tier cap
+    # Also capped per day, so the month's allowance can't be spent in the
+    # first week. A fare worth verifying is as likely on the 28th as the 2nd.
+    daily_budget: 8
+
+  rss:
+    # Human-curated error-fare feeds. Free, no key, and the fastest signal
+    # for genuine mistake fares. Matched against your origins/destinations.
+    enabled: true
+    # Verified working 2026-09-18. The bot filters these by your origins and
+    # destinations itself, so a site-wide feed is fine -- and more reliable
+    # than per-city feeds.
+    #
+    # Note: The Flight Deal's per-city feeds (/category/flight-deals/dfw/feed/)
+    # are widely recommended online but now return zero items -- the site's
+    # category structure changed. Secret Flying has no working feed at all
+    # (/usa-deals/feed/ redirects in a loop); subscribe to their email list
+    # directly at https://www.secretflying.com/alerts/ instead.
+    feeds:
+      - name: "The Flight Deal"
+        url: "https://www.theflightdeal.com/feed/"
+      - name: "The Flight Deal - all deals"
+        url: "https://www.theflightdeal.com/category/flight-deals/feed/"
+    # Keywords that mark a post as worth reading even if no price parses.
+    hot_keywords: ["error fare", "mistake fare", "fuel dump", "glitch"]
+
+# ---------- Email delivery ----------
+# Your address is NOT in this file, so the repo is safe to make public --
+# which matters, because GitHub Actions minutes are unlimited and free on a
+# public repo but capped at 2,000/month on a private one.
+# Set ALERT_EMAIL as a repository secret instead. If it's unset, the bot
+# falls back to SMTP_USER (i.e. it emails you at your own Gmail).
+email:
+  from_name: "Flight Deal Bot"
+  smtp_host: "smtp.gmail.com"
+  smtp_port: 587
+  # Username and app password come from env vars SMTP_USER / SMTP_PASS.
+
+# ---------- Storage ----------
+storage:
+  db_path: "data/prices.db"

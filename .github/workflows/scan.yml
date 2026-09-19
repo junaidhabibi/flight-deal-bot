@@ -1,0 +1,119 @@
+name: Flight deal scan
+
+# This is what keeps the bot running when your laptop is off: GitHub runs it
+# on their servers, on a schedule, forever. Nothing runs on your machine.
+#
+# COST: on a PUBLIC repo, Actions minutes are unlimited and free -- raise the
+# frequency as high as you like. On a PRIVATE repo you get 2,000 minutes a
+# month, and GitHub rounds every run up to a whole minute. At ~4 minutes of
+# work plus runner startup, each run bills about 5 minutes:
+#
+#     every 3 hours  ->  9 runs/day  ->  ~1,350 min/month   (safe, the default)
+#     every 2 hours  -> 13 runs/day  ->  ~1,950 min/month   (too close to 2,000)
+#     every 1 hour   -> 25 runs/day  ->  ~3,750 min/month   (public repo only)
+#
+# The scan rotates through routes, so every 3 hours still covers the whole
+# route list roughly twice a day and watches Stockholm on every single run.
+
+on:
+  schedule:
+    # Every 3 hours. Safe on a private repo's free tier.
+    - cron: "15 */4 * * *"
+    # Daily digest at 12:00 UTC = 7am Central (CDT) / 6am (CST).
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print emails instead of sending"
+        type: boolean
+        default: false
+      digest:
+        description: "Force the digest email"
+        type: boolean
+        default: false
+
+# Never let two runs write the price history at once.
+concurrency:
+  group: flight-scan
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    # A rotating scan is ~4 minutes. 15 is a generous ceiling that still
+    # stops a hung run from eating the month's quota.
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m tests.test_bot
+
+      - name: Check required secrets are set
+        env:
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+        run: |
+          missing=""
+          [ -z "$SERPAPI_KEY" ] && missing="$missing SERPAPI_KEY"
+          [ -z "$SMTP_USER" ] && missing="$missing SMTP_USER"
+          [ -z "$SMTP_PASS" ] && missing="$missing SMTP_PASS"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing"
+            echo "Add them under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          echo "All required secrets present."
+
+      - name: Scan for deals
+        env:
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          # The 12:00 UTC schedule is the digest run.
+          if [ "${{ github.event.schedule }}" = "0 12 * * *" ] || \
+             [ "${{ github.event.inputs.digest }}" = "true" ]; then
+            ARGS="$ARGS --digest"
+          fi
+          python -m bot.main $ARGS
+
+      - name: Show what the bot has learned
+        if: always()
+        run: python -m bot.main --stats || true
+
+      - name: Commit the price history
+        if: always()
+        run: |
+          git config user.name  "flight-deal-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add -f data/prices.db
+          if git diff --staged --quiet; then
+            echo "No history changes."
+          else
+            git commit -m "Price history: $(date -u '+%Y-%m-%d %H:%M UTC')"
+            # Another run may have pushed while this one was scanning.
+            for i in 1 2 3; do
+              git pull --rebase --autostash && git push && break
+              echo "Push attempt $i failed, retrying..."
+              sleep 5
+            done
+          fi

@@ -1,0 +1,5 @@
+0000000000000000000000000000000000000000 e61748f51719044059a61151b3059e82976b4025 Junaid <junaid_64@live.com> 1789777925 +0000	commit (initial): Flight deal bot: stopover-aware fare scanner with record detection
+e61748f51719044059a61151b3059e82976b4025 0cc88ff748434bb92f2a0724d1cb654bee6c3e46 Junaid <junaid_64@live.com> 1789846752 +0000	commit: Fall back to certifi when the platform trust store is empty (macOS python.org installs)
+0cc88ff748434bb92f2a0724d1cb654bee6c3e46 5c2477dcb0e8bee70cdef8559b539f444f530657 Junaid <junaid_64@live.com> 1789846911 +0000	commit: Add one-command setup.sh and .env loading so credentials survive terminal restarts
+5c2477dcb0e8bee70cdef8559b539f444f530657 61626192bc1c14642311bc81ef5dd2325a2b006a Junaid <junaid_64@live.com> 1789846936 +0000	commit: README: lead with the one-command setup
+61626192bc1c14642311bc81ef5dd2325a2b006a fbcf55311dbcd51c8a76a14f04d839a1282f29f3 Junaid <junaid_64@live.com> 1789849416 +0000	commit: setup.sh: fix helper function shadowing the head command, which corrupted every saved credential

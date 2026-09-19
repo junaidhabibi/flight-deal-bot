@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.log
+tests/sample_email.html
+
+# The price history is the bot's memory -- it is committed on purpose by the
+# GitHub Action (git add -f), because a stateless runner has no other way to
+# remember what a route has cost before.
+!data/prices.db
+
+# Backups. setup.sh writes .env.bak, which contains every credential --
+# on a public repo that is a published Gmail app password. Never commit
+# a backup of anything.
+*.bak
+.env.*
+!.env.example
+
+# Local diagnostics and one-off rehearsals. Useful, but not the bot.
+diagnose*.py
+try_*.py
+rehearse.py
+seed_history.py
