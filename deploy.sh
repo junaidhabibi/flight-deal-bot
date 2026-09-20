@@ -192,7 +192,44 @@ else
   printf "     ${D}public = unlimited free Actions minutes; nothing secret is in the code${N}\n"
 fi
 
-git push -u origin HEAD >/dev/null 2>&1 && ok "Pushed" || die "Push failed."
+# Pull before pushing. The bot commits a price-history update to this repo
+# on nearly every run, so after a day of running the local clone is ALWAYS
+# behind and a plain push is rejected as a non-fast-forward. The first
+# version of this script just pushed and died with "Push failed.", hiding
+# the actual reason.
+if git ls-remote --exit-code origin HEAD >/dev/null 2>&1; then
+  git fetch -q origin 2>/dev/null || true
+  if git rev-parse --verify -q origin/main >/dev/null; then
+    behind=$(git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
+    if [ "${behind:-0}" -gt 0 ]; then
+      printf "  ${D}%s new commit(s) on GitHub (the bot's own price history) — rebasing${N}\n" "$behind"
+      if ! git rebase origin/main >/dev/null 2>&1; then
+        # The only file that can genuinely conflict is the binary database,
+        # and GitHub's copy is the authoritative one: it holds the runs that
+        # happened in the cloud, which this machine never saw.
+        if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
+          git checkout --ours data/prices.db >/dev/null 2>&1 || true
+          git add data/prices.db >/dev/null 2>&1 || true
+          if ! git -c core.editor=true rebase --continue >/dev/null 2>&1; then
+            git rebase --abort >/dev/null 2>&1 || true
+            die "Couldn't reconcile with GitHub. Run: git pull --rebase"
+          fi
+          ok "Kept GitHub's price history (it has the cloud runs)"
+        else
+          die "Rebase failed. Run: git pull --rebase"
+        fi
+      else
+        ok "Rebased onto GitHub"
+      fi
+    fi
+  fi
+fi
+
+push_err=$(git push -u origin HEAD 2>&1) && ok "Pushed" || {
+  no "Push failed:"
+  printf "%s\n" "$push_err" | sed 's/^/     /' | head -8
+  exit 1
+}
 
 for v in SERPAPI_KEY SMTP_USER SMTP_PASS ALERT_EMAIL; do
   val=$(grep -E "^$v=" .env | cut -d= -f2-)
