@@ -57,7 +57,8 @@ class DealScorer:
         Deal.history_key): stopover itineraries are compared against other
         stopover itineraries, not against normal round trips.
         """
-        stats = self.hist.route_stats(deal.history_key)
+        window = self.t.get("history_window_days") or None
+        stats = self.hist.route_stats(deal.history_key, window_days=window)
         count = int(stats["count"] or 0)
         min_obs = int(self.t.get("min_observations_for_history", 8))
 
@@ -137,9 +138,13 @@ class DealScorer:
 
         self._set_typical_price(deal, insight)
 
-        # Record check against everything seen before this run.
+        # Record check against what was seen before this run, within the
+        # history window. The window is what stops the bar ratcheting down
+        # permanently -- see History.route_min.
         prior_min = self.hist.route_min(
-            deal.history_key, exclude_last_seconds=exclude_recent_seconds
+            deal.history_key,
+            exclude_last_seconds=exclude_recent_seconds,
+            window_days=self.t.get("history_window_days") or None,
         )
         if prior_min is None and ref.record_price:
             prior_min = ref.record_price
@@ -197,7 +202,8 @@ class DealScorer:
         benchmark logic: real observations on this exact route beat Google's
         route-level range, which beats a hand-entered baseline.
         """
-        stats = self.hist.route_stats(deal.history_key)
+        window = self.t.get("history_window_days") or None
+        stats = self.hist.route_stats(deal.history_key, window_days=window)
         count = int(stats["count"] or 0)
         min_obs = int(self.t.get("min_observations_for_history", 8))
 

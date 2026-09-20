@@ -78,7 +78,6 @@ class GoogleFlightDeals:
         )
         try:
             resp = self.session.get(ENDPOINT, params=params, timeout=self.timeout)
-            self.call_count += 1
         except requests.RequestException as e:
             raise GoogleDealsError(f"network error: {e}") from e
 
@@ -92,6 +91,13 @@ class GoogleFlightDeals:
         data = resp.json()
         if "error" in data:
             raise GoogleDealsError(str(data["error"]))
+
+        # Bill HERE, not at the point the request went out. SerpApi's FAQ:
+        # "Only successful searches are counted toward your monthly
+        # searches. Cached, errored, and failed searches are not." Counting
+        # failures burned a budget that is already tight enough to drop a
+        # sweep a day.
+        self.call_count += 1
         return data
 
     # ---------- the one call that matters ----------
@@ -326,7 +332,6 @@ class GoogleTravelExplore:
         )
         try:
             resp = self.session.get(ENDPOINT, params=params, timeout=self.timeout)
-            self.call_count += 1
         except requests.RequestException as e:
             raise GoogleDealsError(f"network error: {e}") from e
 
@@ -340,6 +345,12 @@ class GoogleTravelExplore:
         data = resp.json()
         if "error" in data:
             raise GoogleDealsError(str(data["error"]))
+
+        # Bill only what SerpApi charges for. Their FAQ: "Only successful
+        # searches are counted toward your monthly searches. Cached,
+        # errored, and failed searches are not." Counting failures spends a
+        # budget that is already tight enough to drop a sweep a day.
+        self.call_count += 1
         return data
 
     def explore(

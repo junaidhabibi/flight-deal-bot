@@ -360,6 +360,20 @@ thresholds:
   # price -- identical on two different weeks -- not a deal.
   baseline_origin: DFW
 
+  # How far back "the record" and the price percentiles reach.
+  #
+  # Added 2026-09-19. Without a window the record is the all-time minimum,
+  # which can only ever move DOWN -- so one unusually cheap fare in month
+  # two raises the bar for every fare after it, and the chance of ever
+  # alerting decays month over month with nothing to stop it. Every price
+  # the bot records is already a cheapest-in-window figure, so the series is
+  # a series of floors and this effect is strong.
+  #
+  # 180 days lets the bar rise again when the market rises, keeps a full
+  # winter or summer in view, and still means "cheapest in six months" --
+  # a claim worth an email, and one a real sale can actually beat.
+  history_window_days: 180
+
   no_history_alert_tier: great
 
   # Minimum discount vs. the route's reference price, to alert at all.

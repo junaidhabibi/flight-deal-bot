@@ -12,15 +12,31 @@ name: Flight deal scan
 #     every 2 hours  -> 13 runs/day  ->  ~1,950 min/month   (too close to 2,000)
 #     every 1 hour   -> 25 runs/day  ->  ~3,750 min/month   (public repo only)
 #
-# The scan rotates through routes, so every 3 hours still covers the whole
-# route list roughly twice a day and watches Stockholm on every single run.
+# Cadence is set by the SerpApi free tier, not by GitHub. Each run spends one
+# search on a sweep of DFW -> all of Europe. The tier is 250/month and has to
+# cover verification too, so the budget is sized for SIX runs a day.
 
 on:
   schedule:
-    # Every 3 hours. Safe on a private repo's free tier.
-    - cron: "15 */4 * * *"
+    # Five scans, plus the digest run below = 6 runs/day.
+    #
+    # This was "15 */4 * * *", which is SIX firings (00:15 ... 20:15) and
+    # with the 12:00 digest made SEVEN runs a day against a budget sized for
+    # six. The daily cap then silently skipped about one sweep every day,
+    # logged only as a warning -- and if the skipped run was the digest one,
+    # there was no digest at all that day. Dropping 12:15 lets the digest
+    # run do double duty.
+    - cron: "15 0,4,8,16,20 * * *"
     # Daily digest at 12:00 UTC = 7am Central (CDT) / 6am (CST).
     - cron: "0 12 * * *"
+    # Weekly "still alive" email, Sundays 13:00 UTC = 8am Central.
+    #
+    # This is the ONLY thing that catches the bot not running at all --
+    # GitHub disabling the schedule after 60 days, Actions switched off, the
+    # workflow file broken, the repo archived. No check inside the bot can
+    # fire when the bot isn't running, so the signal has to be a routine
+    # message whose ABSENCE is noticeable.
+    - cron: "0 13 * * 0"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -95,9 +111,19 @@ jobs:
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             ARGS="$ARGS --dry-run"
           fi
-          # The 12:00 UTC schedule is the digest run.
-          if [ "${{ github.event.schedule }}" = "0 12 * * *" ] || \
-             [ "${{ github.event.inputs.digest }}" = "true" ]; then
+          # Sunday 13:00 UTC is the weekly heartbeat: send it and stop.
+          HOUR=$(date -u +%H)
+          DOW=$(date -u +%u)          # 7 = Sunday
+          if [ "$HOUR" = "13" ] && [ "$DOW" = "7" ]; then
+            python -m bot.main --heartbeat
+            exit $?
+          fi
+
+          # The 12:00 UTC run is the digest. Matched on the HOUR, not on the
+          # literal cron string: comparing against "0 12 * * *" meant any
+          # later edit to that line -- even whitespace -- would silently
+          # disable the digest forever, with no error anywhere.
+          if [ "$HOUR" = "12" ] || [ "${{ github.event.inputs.digest }}" = "true" ]; then
             ARGS="$ARGS --digest"
           fi
           python -m bot.main $ARGS
@@ -111,6 +137,23 @@ jobs:
         run: |
           git config user.name  "flight-deal-bot"
           git config user.email "bot@users.noreply.github.com"
+          # Never commit a database that is already broken. The job has a
+          # 15-minute timeout and this step runs with if: always(), so a
+          # cancelled run can reach here mid-transaction -- and the rollback
+          # journal is not committed alongside the file. Committing that
+          # produces a permanently corrupt DB in the repo, which then makes
+          # every future run die in History.__init__ with no email and no
+          # recovery path.
+          if ! python -c "
+          import sqlite3, sys
+          c = sqlite3.connect('data/prices.db')
+          r = c.execute('PRAGMA integrity_check').fetchone()[0]
+          sys.exit(0 if r == 'ok' else 1)
+          "; then
+            echo "::error::data/prices.db failed its integrity check — not committing it."
+            echo "The last good copy stays in the repo; the next run will use that."
+            exit 1
+          fi
           git add -f data/prices.db
           if git diff --staged --quiet; then
             echo "No history changes."

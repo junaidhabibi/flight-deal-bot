@@ -1,3 +1,9 @@
-requests>=2.31.0
-PyYAML>=6.0.1
-certifi>=2024.2.2
+# Pinned deliberately. This runs unattended every few hours with a fresh
+# `pip install` each time, so an unpinned range means any upstream release
+# ships straight to production at 3am with nobody watching. A requests 3.0
+# or a urllib3 major would simply start failing runs.
+#
+# To update: bump a line, run `python -m tests.test_bot`, commit.
+requests==2.32.3
+PyYAML==6.0.2
+certifi==2024.8.30

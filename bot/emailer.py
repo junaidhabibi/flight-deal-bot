@@ -39,6 +39,22 @@ class EmailError(Exception):
     pass
 
 
+def _local_now(tz_name: str = "") -> datetime:
+    """Now, in the reader's timezone rather than the runner's.
+
+    GitHub's runners are UTC, so datetime.now() printed a time 5-6 hours
+    ahead of Central. Every alert looked hours stale at a glance, on a
+    product whose whole pitch is "fares this low last hours, not days".
+    """
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+            return datetime.now(ZoneInfo(tz_name))
+        except Exception:
+            pass
+    return datetime.now()
+
+
 def build_ssl_context() -> ssl.SSLContext:
     """A TLS context that works on a stock macOS Python install.
 
@@ -86,6 +102,7 @@ class Emailer:
         to_address: str,
         from_name: str = "Flight Deal Bot",
         dry_run: bool = False,
+        timezone: str = "",
     ):
         self.host = smtp_host
         self.port = int(smtp_port)
@@ -94,6 +111,9 @@ class Emailer:
         self.to_address = to_address
         self.from_name = from_name
         self.dry_run = dry_run
+        # Timestamps in the email are rendered in this zone, not the
+        # runner's UTC. config.yml's alerts.timezone feeds this.
+        self.timezone = timezone
         self.sent_count = 0
         self.last_message: Optional[EmailMessage] = None
 
@@ -197,7 +217,7 @@ class Emailer:
         self, deals: Sequence[Deal], rss_items: Sequence[FeedItem], urgent: bool
     ) -> str:
         lines: List[str] = []
-        now = datetime.now().strftime("%a %b %d, %I:%M %p")
+        now = _local_now(self.timezone).strftime("%a %b %d, %I:%M %p")
         lines.append("FLIGHT DEAL BOT")
         lines.append(now)
         lines.append("")
@@ -364,7 +384,7 @@ class Emailer:
     def _html_body(
         self, deals: Sequence[Deal], rss_items: Sequence[FeedItem], urgent: bool
     ) -> str:
-        now = datetime.now().strftime("%A %B %d, %Y at %I:%M %p")
+        now = _local_now(self.timezone).strftime("%A %B %d, %Y at %I:%M %p")
         parts: List[str] = [
             """<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">

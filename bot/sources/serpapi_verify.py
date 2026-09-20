@@ -93,7 +93,6 @@ class SerpApiVerifier:
         )
         try:
             resp = self.session.get(ENDPOINT, params=params, timeout=self.timeout)
-            self.call_count += 1
         except requests.RequestException as e:
             raise SerpApiError(f"network error: {e}") from e
 
@@ -107,6 +106,16 @@ class SerpApiVerifier:
         data = resp.json()
         if "error" in data:
             raise SerpApiError(str(data["error"]))
+
+        # Bill only a search SerpApi actually charges for. Their FAQ: "Only
+        # successful searches are counted toward your monthly searches.
+        # Cached, errored, and failed searches are not."
+        #
+        # This counter previously did not exist at all, while main.verify()
+        # had been changed to bill the DELTA of it -- so verifications were
+        # billed zero and the ledger under-reported against a 250/month
+        # tier that is already tight.
+        self.call_count += 1
         return data
 
     def verify(

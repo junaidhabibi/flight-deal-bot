@@ -1,3 +1,31 @@
+> **READ THIS FIRST — much of what follows is out of date.**
+>
+> This README was written when the bot ran on Travelpayouts with very
+> different thresholds. On 2026-09-19 the fare source was replaced and every
+> number was recalibrated against real measured prices. Sections below still
+> describe the old design.
+>
+> **`config.yml` is the truth.** It carries the current values and, for each
+> one, why it is what it is. When this file and `config.yml` disagree,
+> `config.yml` is right.
+>
+> What actually changed:
+>
+> | | Old (this README) | Now (`config.yml`) |
+> |---|---|---|
+> | Fare source | Travelpayouts / Aviasales | **Google Travel Explore** via SerpApi |
+> | Why | — | Travelpayouts' cache holds no DFW→Europe fares at all |
+> | Price ceiling | $499 | **$625**, all-in |
+> | Minimum discount | 35% | **18%** |
+> | Instant-alert tier | 55% off | **32% off** |
+> | Schedule | every 3 hours | **6 runs/day**, budget-bound |
+> | SerpApi budget | 220/month, 7/day | **240/month, 9/day** — and it is now the *only* source |
+> | Extra | — | weekly heartbeat email, silence detector, 180-day price window |
+>
+> The old baselines were guesses and several were below the routes' real
+> floors, which made alerts arithmetically impossible. See the comments in
+> `config.yml` for the measurements.
+
 # Flight Deal Bot
 
 Scans for heavily discounted flights from Dallas to Europe around the clock,
@@ -50,9 +78,7 @@ python3 -m bot.main --stats         # what it has learned about prices
 python3 -m bot.main --bag           # your carry-on vs. every airline
 ```
 
----
-
-## Making it run without your laptop
+### 6. Put it on GitHub Actions (this is the always-on part)
 
 GitHub runs the bot on **their** servers, on a schedule. Your laptop can be
 closed, off, or at the bottom of a lake. Nothing runs locally.

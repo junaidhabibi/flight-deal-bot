@@ -5,6 +5,7 @@ Usage:
     python -m bot.main --dry-run       # print emails instead of sending
     python -m bot.main --digest        # send the daily digest
     python -m bot.main --stats         # show what the bot has learned
+    python -m bot.main --heartbeat     # weekly "still alive" email
     python -m bot.main --bag           # carry-on fit and fees by airline
     python -m bot.main --test-email    # prove SMTP works
 """
@@ -67,6 +68,16 @@ def redact(text: str) -> str:
     secret scan, sitting in the database from a single proxy error.
     """
     return SECRET_IN_URL.sub(r"\1=[REDACTED]", text or "")
+
+
+def _within_days(stamp: Any, days: int) -> bool:
+    """Is this ISO timestamp within the last `days`? Tolerant of junk."""
+    try:
+        t = datetime.fromisoformat(str(stamp))
+    except (TypeError, ValueError):
+        return False
+    now = datetime.now(t.tzinfo) if t.tzinfo else datetime.now()
+    return (now - t).total_seconds() <= days * 86400
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -174,6 +185,7 @@ class FlightDealBot:
             to_address=to_address,
             from_name=e.get("from_name", "Flight Deal Bot"),
             dry_run=self.dry_run or not password,
+            timezone=str(self.cfg.alerts.get("timezone", "") or ""),
         )
 
     def _init_baggage(self) -> Optional[BaggageAdvisor]:
@@ -783,6 +795,127 @@ class FlightDealBot:
         log.info("Run %d done: %d candidates, %d emails", run_id, len(final), sent)
         return sent
 
+    def heartbeat(self) -> bool:
+        """A weekly "I am alive and here is what I have seen" email.
+
+        This is the most important signal the bot produces, and it exists
+        because of an asymmetry: the bot is DESIGNED to be silent for weeks,
+        so silence carries no information. A healthy quiet bot and a dead
+        one look identical from the inbox.
+
+        _check_for_silence covers the case where the bot runs but sees
+        nothing. It cannot cover the cases where the bot does not run at
+        all -- GitHub disabling the schedule after 60 days of inactivity,
+        the workflow file breaking, Actions being turned off, the repo being
+        archived, a dropped scheduled run. In every one of those the bot is
+        not executing, so no check inside it can fire.
+
+        A heartbeat inverts that. The owner stops needing to detect a
+        failure and only has to notice the absence of a routine message,
+        which is something people are good at. It also surfaces the slow
+        rot that nothing else reports: how close fares are getting to the
+        alert bar, whether the discount threshold has quietly become
+        unreachable, and how much API budget is left.
+        """
+        runs = [r for r in self.hist.recent_runs(80) if r["finished_at"]]
+        week = [r for r in runs if _within_days(r["started_at"], 7)]
+        obs_week = sum((r["observations"] or 0) for r in week)
+        alerts_week = sum((r["alerts_sent"] or 0) for r in week)
+        failed = [r for r in week if r["errors"] and r["errors"] != "[]"]
+
+        used_month = self.hist.api_calls_this_month("serpapi")
+        budget = int(self.cfg.sources.get("serpapi", {}).get("monthly_budget", 240))
+
+        L: List[str] = []
+        L.append("Weekly check-in from the flight bot. Nothing is wrong --")
+        L.append("this arrives every week so that its ABSENCE means something.")
+        L.append("")
+        L.append("If you ever stop getting this, the bot has stopped running.")
+        L.append("Check https://github.com/ -> your flight-deal-bot repo -> Actions.")
+        L.append("")
+        L.append("-" * 58)
+        L.append("LAST 7 DAYS")
+        L.append("-" * 58)
+        L.append(f"  Runs completed:      {len(week)}")
+        L.append(f"  Fares recorded:      {obs_week:,}")
+        L.append(f"  Alerts emailed:      {alerts_week}")
+        L.append(f"  Runs with errors:    {len(failed)}")
+        L.append(f"  SerpApi used:        {used_month} of {budget} this month")
+        L.append("")
+
+        # The part that catches the slow rot: how close is anything getting?
+        L.append("-" * 58)
+        L.append("HOW CLOSE ARE FARES TO ALERTING?")
+        L.append("-" * 58)
+        L.append("  If every route sits far below its bar for months, the")
+        L.append("  thresholds have drifted out of reach and need lowering.")
+        L.append("")
+        home = str(self.cfg.thresholds.get("baseline_origin", "DFW")).upper()
+        watch = sorted(
+            self.cfg.destinations,
+            key=lambda d: -float(d.get("priority", 1.0)),
+        )[:8]
+        any_row = False
+        for d in watch:
+            key = f"{home}-{d['code']}"
+            st = self.hist.route_stats(key)
+            if not st["count"]:
+                continue
+            any_row = True
+            base = self.cfg.baseline(d["code"]) or 0
+            gate = min(
+                base * (1 - float(self.cfg.thresholds["tiers"]["watch"]) / 100),
+                float(self.cfg.thresholds["max_price_usd"]),
+            ) if base else float(self.cfg.thresholds["max_price_usd"])
+            low = float(st["min"])
+            gap = (low - gate) / gate * 100 if gate else 0
+            L.append(
+                f"  {d['city'][:16]:<16} best ${low:>6,.0f}   needs ${gate:>6,.0f}"
+                f"   ({gap:+.0f}%)   {st['count']} seen"
+            )
+        if not any_row:
+            L.append("  No price history yet. Normal in the first week.")
+        L.append("")
+        L.append("  A negative % means a fare has already beaten the bar.")
+        L.append("")
+
+        if failed:
+            L.append("-" * 58)
+            L.append("ERRORS THIS WEEK")
+            L.append("-" * 58)
+            for r in failed[:5]:
+                L.append(f"  {str(r['started_at'])[:16]}  {str(r['errors'])[:110]}")
+            L.append("")
+
+        body = "\n".join(L)
+        subject = (
+            f"[Flights] Weekly check-in -- {obs_week:,} fares seen, "
+            f"{alerts_week} alert{'s' if alerts_week != 1 else ''}"
+        )
+        try:
+            return bool(self.emailer.send(subject, body))
+        except EmailError as e:
+            self._note_error(f"Heartbeat email failed: {e}")
+            return False
+
+    def _hours_since_last_fares(self) -> Optional[float]:
+        """Real elapsed time since a run last saw a fare.
+
+        Beats multiplying the streak by an assumed cadence: the schedule
+        fires 7 times a day, not 6, and runs get delayed or dropped by
+        GitHub, so any fixed number here would be wrong.
+        """
+        for row in self.hist.recent_runs(1000):
+            if row["finished_at"] is None or not (row["observations"] or 0):
+                continue
+            try:
+                seen = datetime.fromisoformat(str(row["started_at"]))
+            except (TypeError, ValueError):
+                return None
+            now = datetime.now(seen.tzinfo) if seen.tzinfo else datetime.now()
+            return max(0.0, (now - seen).total_seconds() / 3600)
+        return None
+
     def _check_for_silence(self, observations_this_run: int) -> None:
         """Email if the bot has stopped seeing fares at all.
 
@@ -805,26 +938,41 @@ class FlightDealBot:
         if threshold <= 0:
             return
 
-        # Count back through finished runs until one found something.
+        # Count back through finished runs until one found something. The
+        # lookback has to be far longer than the threshold: it used to be
+        # threshold*3, so the streak SATURATED at 18 -- and 18 is a multiple
+        # of 6, so the "only every Nth run" guard never suppressed anything
+        # again. A dead bot sent 7 identical emails a day, forever. The
+        # realistic response to that is a Gmail filter, which would also
+        # bury every real deal alert. The cure was worse than the disease.
         streak = 1  # this run
-        for row in self.hist.recent_runs(threshold * 3):
+        for row in self.hist.recent_runs(1000):
             if row["finished_at"] is None:
                 continue
             if (row["observations"] or 0) > 0:
                 break
             streak += 1
 
-        if streak < threshold or streak % threshold != 0:
+        # Escalating, not repeating: warn at 1x, 2x, 4x, 8x ... the
+        # threshold. Roughly 10 emails over a year of death instead of
+        # 2,500, while still nagging often enough early on to be noticed.
+        if streak < threshold:
+            return
+        multiple, rem = divmod(streak, threshold)
+        if rem != 0 or (multiple & (multiple - 1)) != 0:   # not a power of two
             return
 
+        # Report the real elapsed time rather than assuming a cadence.
+        hours = self._hours_since_last_fares()
         log.warning(
-            "No fares seen in %d consecutive runs -- warning by email.", streak
+            "No fares in %d consecutive runs (%s) -- warning by email.",
+            streak, f"{hours:.0f}h" if hours else "unknown",
         )
-        hours = streak * 4
         try:
+            span = f"about {hours:.0f} hours" if hours else "an unknown span"
             self.emailer.send(
                 "[Flights] Heads up: the bot has stopped finding fares",
-                f"The last {streak} runs (about {hours} hours) all returned "
+                f"The last {streak} runs ({span}) all returned "
                 f"zero fares.\n\n"
                 f"That is not the same as 'no deals right now' -- the bot "
                 f"records every fare it sees, deal or not, so zero means it "
@@ -1044,6 +1192,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="show how your carry-on measures up against each airline",
     )
     parser.add_argument("--test-email", action="store_true", help="send a test email")
+    parser.add_argument(
+        "--heartbeat", action="store_true",
+        help="send the weekly 'still alive' email (see heartbeat())",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -1064,6 +1216,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.stats:
             print(bot.stats())
             return 0
+
+        if args.heartbeat:
+            ok = bot.heartbeat()
+            print("Heartbeat sent." if ok else "Heartbeat FAILED to send.")
+            return 0 if ok else 1
 
         if args.test_email:
             ok = bot.emailer.send(

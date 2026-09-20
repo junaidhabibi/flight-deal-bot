@@ -94,41 +94,40 @@ git config user.email >/dev/null 2>&1 || git config user.email "junaid_64@live.c
 if git diff --cached --quiet; then
   ok "Nothing new to commit"
 else
-  git commit -q -m "Switch to Google Travel Explore, and fix what an audit found
+  git commit -q -m "Durability pass: make the quiet failures loud
 
-Travelpayouts' cache has no DFW-to-Europe fares, so the old scan
-returned nothing. Explore answers 'what's cheap from DFW to anywhere
-in Europe' in one request -- ~48 destinations, 20 on the list.
+The bot is designed to stay silent for weeks, which means silence carries
+no information and a dead bot looks exactly like a healthy one. This fixes
+the ways it could rot without anyone noticing.
 
-Also fixes, all caught by rehearsing the pipeline on real data:
-  - a phantom \$90 carry-on fee on every route, from treating Explore's
-    'multi' airline placeholder as an unknown airline that charges
-  - Finnair and Icelandair marked as charging for a cabin bag, which is
-    their intra-European rule, not their transatlantic one
-  - baselines measured from Dallas being applied to Chicago fares, which
-    scored a routine \$393 ORD-KEF fare as '40% off'
-  - alerting off a comparison against the price ceiling, which
-    manufactures a discount out of a preference
-  - unittest.main() sitting mid-file, so the suite the Action runs
-    silently skipped 11 tests
+  - weekly heartbeat email. The only thing that can catch the bot NOT
+    RUNNING (GitHub disabling the schedule after 60 days, Actions off,
+    workflow broken) -- no check inside the bot fires when the bot is not
+    executing. It also reports how close each route is to its alert bar.
+  - the silence warning saturated: the lookback capped the streak at 18,
+    a multiple of the 6-run threshold, so a dead bot emailed on EVERY run
+    forever. ~2,500 a year, which trains you to filter the bot away and
+    lose the real alerts with it. Now escalates 1x, 2x, 4x and stops.
+  - the record bar could only ever ratchet DOWN: one lucky cheap fare
+    raised the difficulty for 18 months, so the chance of alerting decayed
+    every month by construction. Records now use a 180-day window.
+  - SerpApi billing was wrong in both directions -- the verifier never
+    counted its searches at all (under-billing against a hard 250/month
+    cap), while failures WERE counted, which their FAQ says are free.
+  - the schedule fired 7 times a day against a budget sized for 6, so one
+    sweep was silently skipped daily -- and if it was the digest run,
+    there was no digest that day. Now 6 runs.
+  - the digest was detected by comparing an exact cron string; any edit to
+    that line would have disabled it forever, silently. Matches the hour.
+  - a corrupt prices.db was committable, which would kill every future run
+    with no email and no recovery. PRAGMA integrity_check now gates it.
+  - email timestamps used the runner's UTC clock, so every alert looked
+    5-6 hours stale.
+  - dependencies pinned: unpinned ranges ship upstream releases straight
+    to production at 3am.
+  - README banner: it documented the old thresholds and would have
+    actively misled anyone tuning this a year from now."
 
-Then a full audit, which found nine more of the same kind:
-  - RSS items marked seen on FETCH, so anything found by a non-digest
-    run (6 of every 7) was recorded, never sent, and then filtered out
-    of the digest that would have sent it
-  - the daily email cap counting DEALS, so one email of 7 deals tripped
-    a cap of 6 and gagged the bot for a day right after a sale
-  - no way to tell 'no deals today' from 'the source is broken': both
-    exit 0 and show a green check. Added a silence warning.
-  - a missing stop count defaulting to 0, which short-circuits the whole
-    layover rule as 'nonstop' and prints that in the email
-  - a >120h layover estimate never rejected, and never even flagged
-  - the email calling a connecting itinerary 'nonstop'
-  - the workflow's push retry ending on sleep, so a lost price history
-    exited 0
-  - failed verifications not billed, under-reporting the API ledger
-  - the dead-zone estimate discarding fares it cannot distinguish from
-    a routing detour (Istanbul adds 5h of real flying to DFW-ARN)"
   ok "Committed"
 fi
 

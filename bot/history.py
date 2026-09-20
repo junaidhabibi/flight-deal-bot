@@ -15,7 +15,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .models import Deal
 
@@ -145,12 +145,35 @@ class History:
             )
         return len(rows)
 
-    def route_stats(self, route: str) -> Dict[str, Optional[float]]:
-        """Min / percentiles / count for a route across all history."""
-        cur = self._conn.execute(
-            "SELECT price_usd FROM observations WHERE route = ? ORDER BY price_usd",
-            (route,),
-        )
+    def route_stats(
+        self, route: str, window_days: Optional[int] = None
+    ) -> Dict[str, Optional[float]]:
+        """Min / percentiles / count for a route.
+
+        window_days limits this to recent observations. That matters more
+        than it looks: every fare the bot records is already a cheapest-in-
+        window price, so the series is a series of floors and its 10th
+        percentile sits very close to its minimum. Against ALL history that
+        bar only ever moves down -- one lucky cheap observation in month 2
+        raises the difficulty for the next 18 months, and the chance of ever
+        alerting decays to nothing with nothing to arrest it.
+
+        A trailing window lets the bar rise again when the market rises, so
+        "cheap" keeps meaning cheap-for-right-now.
+        """
+        if window_days:
+            cutoff = _iso(_utcnow() - timedelta(days=window_days))
+            cur = self._conn.execute(
+                "SELECT price_usd FROM observations "
+                "WHERE route = ? AND observed_at >= ? ORDER BY price_usd",
+                (route, cutoff),
+            )
+        else:
+            cur = self._conn.execute(
+                "SELECT price_usd FROM observations WHERE route = ? "
+                "ORDER BY price_usd",
+                (route,),
+            )
         prices = [r["price_usd"] for r in cur.fetchall()]
         if not prices:
             return {"count": 0, "min": None, "p10": None, "median": None, "mean": None}
@@ -171,24 +194,37 @@ class History:
             "mean": sum(prices) / len(prices),
         }
 
-    def route_min(self, route: str, exclude_last_seconds: int = 0) -> Optional[float]:
-        """Cheapest price ever recorded for a route.
+    def route_min(
+        self,
+        route: str,
+        exclude_last_seconds: int = 0,
+        window_days: Optional[int] = None,
+    ) -> Optional[float]:
+        """Cheapest price recorded for a route, optionally within a window.
 
-        exclude_last_seconds lets the caller ignore observations just written
-        in this run, so a fare isn't compared against itself.
+        exclude_last_seconds ignores observations just written in this run,
+        so a fare isn't compared against itself.
+
+        window_days bounds how far back "the record" reaches. Without it the
+        record is monotonically non-increasing forever: a single unusually
+        cheap fare makes every subsequent fare fail the record test for as
+        long as it is retained, so the bot gets quieter every month by
+        construction. "Cheapest in the last six months" is both a more
+        useful claim and one a real sale can actually beat.
         """
+        clauses = ["route = ?"]
+        params: List[Any] = [route]
         if exclude_last_seconds:
-            cutoff = _iso(_utcnow() - timedelta(seconds=exclude_last_seconds))
-            cur = self._conn.execute(
-                "SELECT MIN(price_usd) AS m FROM observations "
-                "WHERE route = ? AND observed_at < ?",
-                (route, cutoff),
-            )
-        else:
-            cur = self._conn.execute(
-                "SELECT MIN(price_usd) AS m FROM observations WHERE route = ?",
-                (route,),
-            )
+            clauses.append("observed_at < ?")
+            params.append(_iso(_utcnow() - timedelta(seconds=exclude_last_seconds)))
+        if window_days:
+            clauses.append("observed_at >= ?")
+            params.append(_iso(_utcnow() - timedelta(days=window_days)))
+        cur = self._conn.execute(
+            "SELECT MIN(price_usd) AS m FROM observations WHERE "
+            + " AND ".join(clauses),
+            params,
+        )
         row = cur.fetchone()
         return row["m"] if row and row["m"] is not None else None
 

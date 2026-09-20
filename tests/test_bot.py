@@ -63,6 +63,12 @@ def leg_row(dep: datetime, price: float, duration: int = 600, transfers: int = 0
 # ======================================================================
 
 
+
+def _iso_days_ago(days: int) -> str:
+    from datetime import timezone as _tz
+    return (datetime.now(_tz.utc) - timedelta(days=days)).isoformat()
+
+
 class TestLayoverRule(unittest.TestCase):
     def setUp(self):
         self.builder = StopoverBuilder(
@@ -2134,6 +2140,232 @@ class TestDetourVersusLayover(unittest.TestCase):
             verify_layover_rule(d, self.rules),
             "an 8h built stopover is squarely in the dead zone",
         )
+
+
+
+# ======================================================================
+#  Durability regressions — found 2026-09-19 hunting for reasons the bot
+#  would quietly stop being useful over months of unattended running.
+# ======================================================================
+
+
+class TestSilenceWarningIsBounded(unittest.TestCase):
+    """It used to saturate: the lookback capped the streak at 18, and 18 is
+    a multiple of the 6-run threshold, so a dead bot emailed on EVERY run
+    forever. ~2,500 identical emails a year. The realistic response is a
+    Gmail filter, which would also bury every genuine deal alert."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SERPAPI_KEY"] = "fake-key"
+        self.cfg = Config.load(Path(__file__).resolve().parents[1] / "config.yml")
+        self.cfg._d["storage"]["db_path"] = f"{self.tmp.name}/bounded.db"
+        from bot.main import FlightDealBot
+        self.bot = FlightDealBot(self.cfg, dry_run=True)
+        self.sent = []
+        self.bot.emailer.send = lambda s_, t_, h_="": self.sent.append(s_) or True
+
+    def tearDown(self):
+        self.bot.close(); self.tmp.cleanup()
+        os.environ.pop("SERPAPI_KEY", None)
+
+    def _dead_runs(self, n):
+        for _ in range(n):
+            rid = self.bot.hist.start_run()
+            self.bot.hist.finish_run(rid, observations=0, candidates=0,
+                                     alerts_sent=0, errors=[])
+
+    def test_a_year_of_death_does_not_produce_thousands_of_emails(self):
+        threshold = int(self.cfg.alerts.get("silence_warning_after_runs", 6))
+        for _ in range(400):                 # ~2 months of 7 runs/day
+            self._dead_runs(1)
+            self.bot._check_for_silence(0)
+        self.assertLess(
+            len(self.sent), 12,
+            f"sent {len(self.sent)} silence emails — this is what trains "
+            f"someone to filter the bot into the trash",
+        )
+        self.assertGreaterEqual(len(self.sent), 4, "warned too rarely to notice")
+
+    def test_it_still_warns_promptly_the_first_time(self):
+        threshold = int(self.cfg.alerts.get("silence_warning_after_runs", 6))
+        self._dead_runs(threshold - 1)
+        self.bot._check_for_silence(0)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_warnings_escalate_rather_than_repeat(self):
+        """Gaps between warnings should grow, not stay constant."""
+        marks = []
+        for i in range(1, 200):
+            self._dead_runs(1)
+            before = len(self.sent)
+            self.bot._check_for_silence(0)
+            if len(self.sent) > before:
+                marks.append(i)
+        gaps = [b - a for a, b in zip(marks, marks[1:])]
+        self.assertTrue(
+            all(y >= x for x, y in zip(gaps, gaps[1:])),
+            f"gaps between warnings did not widen: {marks}",
+        )
+
+
+class TestHeartbeat(unittest.TestCase):
+    """The bot is designed to be silent for weeks, so silence proves
+    nothing. A weekly message means its ABSENCE is the signal — and that
+    covers the failures no in-process check can ever see, like GitHub
+    disabling the schedule."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SERPAPI_KEY"] = "fake-key"
+        self.cfg = Config.load(Path(__file__).resolve().parents[1] / "config.yml")
+        self.cfg._d["storage"]["db_path"] = f"{self.tmp.name}/hb.db"
+        from bot.main import FlightDealBot
+        self.bot = FlightDealBot(self.cfg, dry_run=True)
+        self.sent = {}
+        self.bot.emailer.send = (
+            lambda s_, t_, h_="": self.sent.update(subject=s_, body=t_) or True
+        )
+
+    def tearDown(self):
+        self.bot.close(); self.tmp.cleanup()
+        os.environ.pop("SERPAPI_KEY", None)
+
+    def test_it_sends_even_with_no_history_at_all(self):
+        """Week one. It must not crash on an empty database."""
+        self.assertTrue(self.bot.heartbeat())
+        self.assertIn("[Flights]", self.sent["subject"])
+
+    def test_it_says_how_to_tell_something_is_wrong(self):
+        self.bot.heartbeat()
+        body = self.sent["body"]
+        self.assertIn("ABSENCE", body)
+        self.assertIn("Actions", body, "no instruction for what to check")
+
+    def test_it_reports_the_gap_to_the_alert_bar(self):
+        """The drift signal: if every route sits far above its bar for
+        months, the thresholds have become unreachable."""
+        d = Deal(origin="DFW", destination="ARN", destination_city="Stockholm",
+                 price_usd=567, depart_date=date(2027, 1, 10),
+                 return_date=date(2027, 1, 20))
+        self.bot.hist.record_observations([d])
+        self.bot.heartbeat()
+        self.assertIn("Stockholm", self.sent["body"])
+        self.assertIn("needs $", self.sent["body"])
+
+
+class TestHistoryWindowStopsTheRatchet(unittest.TestCase):
+    """Without a trailing window the record is the all-time minimum, which
+    only ever moves down — so one lucky cheap fare makes every later fare
+    fail the record test, and the bot gets quieter every month."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.hist = History(f"{self.tmp.name}/win.db")
+
+    def tearDown(self):
+        self.hist.close(); self.tmp.cleanup()
+
+    def _observe(self, price, days_ago):
+        d = Deal(origin="DFW", destination="ARN", destination_city="Stockholm",
+                 price_usd=price, depart_date=date(2027, 1, 10),
+                 return_date=date(2027, 1, 20))
+        self.hist.record_observations([d])
+        old = _iso_days_ago(days_ago)
+        self.hist._conn.execute(
+            "UPDATE observations SET observed_at=? WHERE price_usd=?", (old, price))
+        self.hist._conn.commit()
+
+    def test_an_ancient_low_stops_blocking_new_records(self):
+        self._observe(400, days_ago=300)     # a fluke, long ago
+        self._observe(600, days_ago=5)
+        self.assertEqual(self.hist.route_min("DFW-ARN"), 400)
+        self.assertEqual(
+            self.hist.route_min("DFW-ARN", window_days=180), 600,
+            "a 300-day-old fluke still defines 'the record'",
+        )
+
+    def test_the_window_does_not_hide_recent_lows(self):
+        self._observe(450, days_ago=30)
+        self._observe(600, days_ago=5)
+        self.assertEqual(self.hist.route_min("DFW-ARN", window_days=180), 450)
+
+    def test_stats_respect_the_window_too(self):
+        self._observe(400, days_ago=300)
+        self._observe(600, days_ago=5)
+        self.assertEqual(self.hist.route_stats("DFW-ARN")["count"], 2)
+        self.assertEqual(
+            self.hist.route_stats("DFW-ARN", window_days=180)["count"], 1)
+
+
+class TestSerpApiBillingMatchesTheirPolicy(unittest.TestCase):
+    """SerpApi's FAQ: "Only successful searches are counted toward your
+    monthly searches. Cached, errored, and failed searches are not."
+    Billing failures spends a budget already tight enough to drop a sweep
+    a day; billing nothing overruns the real quota."""
+
+    def _client(self, kind):
+        from bot.sources.google_deals import GoogleTravelExplore, GoogleDealsError
+        from bot.sources.serpapi_verify import SerpApiVerifier, SerpApiError
+        return {
+            "explore": (GoogleTravelExplore(api_key="k"), GoogleDealsError),
+            "verify": (SerpApiVerifier("k"), SerpApiError),
+        }[kind]
+
+    def _drive(self, client, err, outcome):
+        import types, requests
+
+        class Resp:
+            def __init__(self, c, p): self.status_code, self._p = c, p
+            def json(self): return self._p
+            @property
+            def text(self): return str(self._p)
+
+        def get(*a, **k):
+            if outcome == "ok":      return Resp(200, {"destinations": []})
+            if outcome == "http500": return Resp(500, "boom")
+            if outcome == "apierr":  return Resp(200, {"error": "bad"})
+            raise requests.RequestException("no network")
+
+        client.session = types.SimpleNamespace(get=get)
+        try:
+            client._search({"x": 1})
+        except err:
+            pass
+        return client.call_count
+
+    def test_a_successful_search_is_billed_once(self):
+        for kind in ("explore", "verify"):
+            c, e = self._client(kind)
+            self.assertEqual(self._drive(c, e, "ok"), 1, kind)
+
+    def test_failures_are_not_billed(self):
+        for kind in ("explore", "verify"):
+            for outcome in ("http500", "apierr", "network"):
+                c, e = self._client(kind)
+                self.assertEqual(
+                    self._drive(c, e, outcome), 0,
+                    f"{kind} billed a {outcome} that SerpApi does not charge for",
+                )
+
+
+class TestEmailUsesTheReadersClock(unittest.TestCase):
+    def test_utc_runner_renders_central_time(self):
+        """GitHub runners are UTC. Every alert used to be stamped 5-6 hours
+        ahead, which makes a fresh fare look stale."""
+        from bot.emailer import _local_now
+        from datetime import timezone as _tz
+        utc = datetime.now(_tz.utc)
+        local = _local_now("America/Chicago")
+        self.assertNotEqual(
+            utc.strftime("%H"), local.strftime("%H"),
+            "timestamp is still on the runner's clock",
+        )
+
+    def test_a_bad_timezone_does_not_crash_the_email(self):
+        from bot.emailer import _local_now
+        self.assertIsNotNone(_local_now("Nonsense/Zone"))
+        self.assertIsNotNone(_local_now(""))
 
 
 
