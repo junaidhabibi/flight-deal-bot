@@ -348,12 +348,24 @@ class Emailer:
         if rss_items:
             lines.append("")
             lines.append("=" * 62)
-            lines.append("FROM THE ERROR-FARE FEEDS")
+            lines.append("POSTS FROM DEAL BLOGS -- not checked by this bot")
             lines.append("=" * 62)
+            lines.append("These are links other people published. The bot has")
+            lines.append("not priced them, applied your layover rule, or added")
+            lines.append("your carry-on. Treat them as tips, not findings.")
             for item in rss_items[:8]:
                 tag = " [HOT]" if item.is_hot else ""
                 price = f" (${item.price_usd:,.0f})" if item.price_usd else ""
+                # Say which of YOUR airports this leaves from. Without it a
+                # post from any US city looked the same as one you can use.
+                if item.matched_origins:
+                    frm = f"   from: {', '.join(item.matched_origins)}"
+                elif getattr(item, "origin_is_nationwide", False):
+                    frm = "   from: nationwide (check it includes Dallas)"
+                else:
+                    frm = "   from: not stated in the post"
                 lines.append(f"\n * {item.title}{price}{tag}")
+                lines.append(frm)
                 lines.append(f"   {item.link}")
             lines.append("")
 
@@ -593,13 +605,27 @@ class Emailer:
             parts.append("</div>")
 
         if rss_items:
-            parts.append('<div class="rss"><strong>From the error-fare feeds</strong>')
+            parts.append(
+                '<div class="rss"><strong>Posts from deal blogs</strong>'
+                '<div style="color:#64748b;font-size:12px;padding:4px 0 8px">'
+                "Links other people published. Not priced, layover-checked or "
+                "carry-on adjusted by this bot &mdash; tips, not findings."
+                "</div>"
+            )
             for item in rss_items[:8]:
                 price = f" (${item.price_usd:,.0f})" if item.price_usd else ""
                 hot = " &middot; <strong>HOT</strong>" if item.is_hot else ""
+                if item.matched_origins:
+                    frm = ", ".join(item.matched_origins)
+                elif getattr(item, "origin_is_nationwide", False):
+                    frm = "nationwide"
+                else:
+                    frm = "origin not stated"
                 parts.append(
                     f'<div style="padding:6px 0"><a href="{_esc(item.link)}">'
-                    f"{_esc(item.title)}</a>{price}{hot}</div>"
+                    f"{_esc(item.title)}</a>{price}{hot}"
+                    f'<div style="color:#64748b;font-size:12px">from '
+                    f"{_esc(frm)}</div></div>"
                 )
             parts.append("</div>")
 

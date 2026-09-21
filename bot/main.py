@@ -620,6 +620,12 @@ class FlightDealBot:
         }
         origin_cities = [o.get("name", "") for o in self.cfg.origins]
 
+        # Aliases are what actually make an origin match. `name` is for the
+        # email; a post says "Dallas to Oslo", not "Dallas/Fort Worth".
+        origin_aliases = {
+            o["code"]: list(o.get("aliases") or [o.get("name", o["code"])])
+            for o in self.cfg.origins
+        }
         annotated = self.rss.annotate(
             items,
             origin_codes=self.cfg.origin_codes,
@@ -627,6 +633,7 @@ class FlightDealBot:
             city_names=city_names,
             hot_keywords=cfg.get("hot_keywords", []),
             origin_city_names=origin_cities,
+            origin_aliases=origin_aliases,
         )
         seen = {i.guid for i in annotated if self.hist.rss_seen(i.guid)}
         fresh = self.rss.relevant(
@@ -840,6 +847,13 @@ class FlightDealBot:
         L.append(f"  Fares recorded:      {obs_week:,}")
         L.append(f"  Alerts emailed:      {alerts_week}")
         L.append(f"  Runs with errors:    {len(failed)}")
+        # A run that recorded nothing is not an error and shows a green
+        # check, but it means no fare data. Four in a row happened on
+        # 2026-09-20 when the rolling API cap starved the sweep, and
+        # nothing surfaced it. This line is how that becomes visible.
+        blank = [r for r in week if not (r["observations"] or 0)]
+        L.append(f"  Runs that saw NO fares: {len(blank)}"
+                 + ("   <-- worth a look" if len(blank) > 2 else ""))
         L.append(f"  SerpApi used:        {used_month} of {budget} this month")
         L.append("")
 

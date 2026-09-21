@@ -4,10 +4,18 @@
 # ============================================================
 
 # ---------- Where you fly from ----------
+# `aliases` are what the deal-blog matcher looks for in a headline. They are
+# separate from `name` on purpose: the names below read well in an email but
+# never appear verbatim in a post titled "Dallas to Oslo, Norway for $298".
+# Without these, almost nothing matched an origin -- and because the RSS
+# filter checked only the DESTINATION, every European deal from every US
+# city was emailed. Keep aliases specific: a bare "Chicago" is fine, but do
+# not add anything that could appear in unrelated prose.
 origins:
   # Your home airport. Listed first = preferred.
   - code: DFW
     name: "Dallas/Fort Worth"
+    aliases: ["Dallas", "Fort Worth", "Dallas/Fort Worth", "DFW"]
     weight: 1.00      # no penalty
   # NOTE: Dallas Love Field (DAL) is deliberately NOT here. It has no
   # international service at all -- 98% Southwest, entirely domestic -- so
@@ -18,12 +26,15 @@ origins:
   # Cheap one-hour hops / short drives you'd tolerate for a great fare.
   - code: AUS
     name: "Austin"
+    aliases: ["Austin", "AUS"]
     weight: 0.92
   - code: IAH
     name: "Houston Intercontinental"
+    aliases: ["Houston", "IAH"]
     weight: 0.90
   - code: ORD
     name: "Chicago O'Hare"
+    aliases: ["Chicago", "ORD", "O'Hare"]
     weight: 0.80      # only worth it if the fare is spectacular
 
 # ---------- Where you want to go ----------
@@ -538,7 +549,19 @@ sources:
     monthly_budget: 240        # stay under the 250 free-tier cap
     # Also capped per day, so the month's allowance can't be spent in the
     # first week. A fare worth verifying is as likely on the 28th as the 2nd.
-    daily_budget: 9
+    # Raised 9 -> 12 on 2026-09-21 after this starved production for a day.
+    #
+    # This is a ROLLING 24-hour cap, not a calendar-day one. On 2026-09-20
+    # a burst of manual test runs filled the window, and the next FOUR
+    # scheduled runs found no room and skipped their sweep -- 16 hours with
+    # no fare data, recorded as errors=[] and a green check. Only the
+    # heartbeat's "runs that saw no fares" line would have shown it.
+    #
+    # Steady state is 6 scheduled runs/day. At 12 the cap absorbs ~4 manual
+    # runs on top of that before it bites, and the MONTHLY cap (240 against
+    # a 250 tier) remains the real guard: 6/day x 30 = 180 plus occasional
+    # verification sits comfortably inside it.
+    daily_budget: 12
 
   rss:
     # Human-curated error-fare feeds. Free, no key, and the fastest signal

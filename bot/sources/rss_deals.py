@@ -43,6 +43,9 @@ class FeedItem:
     matched_destinations: List[str] = field(default_factory=list)
     matched_cities: List[str] = field(default_factory=list)
     is_hot: bool = False
+    # Set when the post says the fare applies from many/most US cities, in
+    # which case it is worth seeing even without a named origin match.
+    origin_is_nationwide: bool = False
 
     @property
     def text(self) -> str:
@@ -158,6 +161,7 @@ class RSSDealWatcher:
         city_names: Dict[str, str],
         hot_keywords: Sequence[str] = (),
         origin_city_names: Sequence[str] = (),
+        origin_aliases: Optional[Dict[str, Sequence[str]]] = None,
     ) -> List[FeedItem]:
         """Tag each item with price, matched routes and hotness."""
         hot = [k.lower() for k in hot_keywords]
@@ -173,13 +177,21 @@ class RSSDealWatcher:
             )
             item.is_hot = any(k in lower for k in hot)
 
-            item.matched_origins = [
-                c for c in origin_codes if _mentions(lower, c, city_names.get(c, ""))
-            ]
-            for city in origin_city_names:
-                if city and city.lower() in lower:
-                    item.matched_origins.append(city)
-            item.matched_origins = sorted(set(item.matched_origins))
+            # Origins were matched against `city_names`, which is the
+            # DESTINATION map -- so city_names.get("DFW") was "" and only a
+            # literal "DFW" in the text could match. The fallback then
+            # compared the configured name verbatim, and those names are
+            # "Dallas/Fort Worth" and "Chicago O'Hare", which never appear
+            # in a headline that says "Dallas to Oslo". Net effect: almost
+            # nothing ever matched an origin -- and since relevant() did not
+            # check origins at all, every European deal from every US city
+            # was emailed.
+            aliases = origin_aliases or {}
+            item.matched_origins = sorted({
+                c for c in origin_codes
+                if _mentions_any(lower, [c] + list(aliases.get(c, ())))
+            })
+            item.origin_is_nationwide = bool(NATIONWIDE_RE.search(lower))
 
             item.matched_destinations = [
                 c for c in destination_codes if _mentions(lower, c, city_names.get(c, ""))
@@ -196,13 +208,28 @@ class RSSDealWatcher:
         max_price: Optional[float] = None,
         require_destination: bool = True,
         seen: Optional[Set[str]] = None,
+        require_origin: bool = True,
     ) -> List[FeedItem]:
-        """Filter down to items worth putting in front of a human."""
+        """Filter down to items worth putting in front of a human.
+
+        require_origin exists because this filter used to check only where a
+        deal GOES, never where it LEAVES FROM. These feeds cover every US
+        city, so "Boston to Oslo $298" matched Oslo and was emailed to
+        someone who flies out of Dallas and cannot use it.
+        """
         seen = seen or set()
         keep: List[FeedItem] = []
         for item in items:
             if item.guid in seen:
                 continue
+
+            if require_origin and not item.matched_origins:
+                # A genuinely nationwide fare is usable from anywhere, so it
+                # survives. Everything else has to leave from an airport
+                # that is actually on the list.
+                if not getattr(item, "origin_is_nationwide", False):
+                    continue
+
             if require_destination and not item.matched_destinations:
                 # An explicit error/mistake fare post still gets through if it
                 # at least mentions Europe -- those are worth a look regardless.
@@ -230,6 +257,32 @@ def _text(node) -> str:
 
 def _strip_tags(text: str) -> str:
     return re.sub(r"<[^>]+>", " ", text or "").strip()
+
+
+# Posts that genuinely apply from anywhere, which are worth seeing whatever
+# your home airport is.
+NATIONWIDE_RE = re.compile(
+    r"\b(nationwide|various\s+u\.?s\.?\s+cities|multiple\s+u\.?s\.?\s+cities"
+    r"|many\s+u\.?s\.?\s+cities|most\s+u\.?s\.?\s+cities)\b",
+    re.I,
+)
+
+
+def _mentions_any(lower_text: str, needles: Sequence[str]) -> bool:
+    """True if any needle appears as a whole word/phrase.
+
+    A bare 3-letter code needs word boundaries so "ord" doesn't match
+    "Ordinary"; a multi-word city name is matched as a phrase.
+    """
+    for n in needles:
+        if not n:
+            continue
+        n = n.strip().lower()
+        if not n:
+            continue
+        if re.search(rf"(?<!\w){re.escape(n)}(?!\w)", lower_text):
+            return True
+    return False
 
 
 def _mentions(lower_text: str, code: str, city: str) -> bool:

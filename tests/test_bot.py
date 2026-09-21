@@ -2369,6 +2369,91 @@ class TestEmailUsesTheReadersClock(unittest.TestCase):
 
 
 
+class TestRSSRespectsYourOrigins(unittest.TestCase):
+    """Junaid got emailed east-coast-to-Norway deals. The RSS filter checked
+    where a deal GOES and never where it LEAVES FROM, and the origin matcher
+    was broken anyway: it looked origin cities up in the DESTINATION name
+    map, and compared "Dallas/Fort Worth" verbatim against headlines that
+    say "Dallas". Almost nothing ever matched an origin."""
+
+    def setUp(self):
+        from bot.sources.rss_deals import RSSDealWatcher
+        self.cfg = Config.load(Path(__file__).resolve().parents[1] / "config.yml")
+        self.w = RSSDealWatcher([])
+        self.cities = {d["code"]: d.get("city", d["code"])
+                       for d in self.cfg.destinations}
+        self.aliases = {o["code"]: list(o.get("aliases") or [o.get("name", o["code"])])
+                        for o in self.cfg.origins}
+
+    def _judge(self, *titles):
+        from bot.sources.rss_deals import FeedItem
+        items = [FeedItem(guid=f"g{i}", title=t, link="", summary="", published=None)
+                 for i, t in enumerate(titles)]
+        ann = self.w.annotate(
+            items, origin_codes=self.cfg.origin_codes,
+            destination_codes=self.cfg.destination_codes, city_names=self.cities,
+            hot_keywords=self.cfg.sources["rss"].get("hot_keywords", []),
+            origin_city_names=[o.get("name", "") for o in self.cfg.origins],
+            origin_aliases=self.aliases)
+        kept = {i.guid for i in self.w.relevant(
+            ann, max_price=self.cfg.thresholds["max_price_usd"], seen=set())}
+        return ann, kept
+
+    def test_east_coast_departures_are_not_emailed(self):
+        """The actual complaint."""
+        bad = ["Boston to Oslo, Norway for $298 roundtrip",
+               "New York to Oslo, Norway for $315 roundtrip",
+               "Washington D.C. to Stockholm, Sweden for $340 roundtrip",
+               "Philadelphia to Copenhagen for $355 roundtrip",
+               "Newark to Stockholm for $362 roundtrip"]
+        ann, kept = self._judge(*bad)
+        self.assertEqual(
+            len(kept), 0,
+            "still emailing deals from airports he does not fly out of",
+        )
+
+    def test_his_own_airports_still_get_through(self):
+        good = ["Dallas to Stockholm, Sweden for $412 roundtrip",
+                "Dallas/Fort Worth to Oslo, Norway for $430 roundtrip",
+                "Houston to Copenhagen, Denmark for $455 roundtrip",
+                "Chicago to Oslo, Norway for $389 roundtrip",
+                "Austin to Dublin, Ireland for $401 roundtrip"]
+        ann, kept = self._judge(*good)
+        self.assertEqual(len(kept), len(good),
+                         "dropped a deal from an airport he actually uses")
+
+    def test_dallas_is_matched_by_the_word_dallas(self):
+        """The configured name is "Dallas/Fort Worth"; no headline says that."""
+        ann, _ = self._judge("Dallas to Stockholm, Sweden for $412 roundtrip")
+        self.assertIn("DFW", ann[0].matched_origins)
+
+    def test_a_genuine_nationwide_fare_survives(self):
+        ann, kept = self._judge(
+            "Nationwide error fare to Stockholm for $290 roundtrip")
+        self.assertEqual(len(kept), 1)
+        self.assertTrue(ann[0].origin_is_nationwide)
+
+    def test_a_destination_he_does_not_want_is_still_dropped(self):
+        _, kept = self._judge("Dallas to Bogota, Colombia for $210 roundtrip")
+        self.assertEqual(len(kept), 0)
+
+    def test_a_code_is_not_matched_inside_another_word(self):
+        """A bare 3-letter code needs word boundaries: "ORD" must not match
+        "Ordinary", and "AUS" must not match "Austria"."""
+        ann, _ = self._judge("Ordinary fares to Austria from Boston for $500")
+        self.assertEqual(ann[0].matched_origins, [])
+
+    def test_the_email_says_which_airport_it_leaves_from(self):
+        from bot.emailer import Emailer
+        ann, _ = self._judge("Dallas to Oslo, Norway for $430 roundtrip")
+        e = Emailer(smtp_host="x", smtp_port=1, username="u", password="",
+                    to_address="t@example.com", dry_run=True)
+        body = e._text_body([], ann, urgent=False)
+        self.assertIn("from: DFW", body)
+        self.assertIn("not checked by this bot", body)
+
+
+
 # ======================================================================
 #  NOTE: this block must stay at the very END of the file.
 #
