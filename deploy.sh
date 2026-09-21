@@ -203,7 +203,16 @@ if git ls-remote --exit-code origin HEAD >/dev/null 2>&1; then
     behind=$(git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
     if [ "${behind:-0}" -gt 0 ]; then
       printf "  ${D}%s new commit(s) on GitHub (the bot's own price history) — rebasing${N}\n" "$behind"
-      if ! git rebase origin/main >/dev/null 2>&1; then
+      # A leftover index or a half-finished rebase makes this fail before it
+      # starts ("your index contains uncommitted changes"). Clear the way,
+      # but never discard real work: only locks and an abandoned rebase.
+      rm -f .git/index.lock .git/HEAD.lock 2>/dev/null || true
+      if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
+        printf "  ${Y}a previous rebase was left unfinished — abandoning it${N}\n"
+        git rebase --abort >/dev/null 2>&1 || true
+      fi
+      rebase_err=$(git rebase origin/main 2>&1)
+      if [ $? -ne 0 ]; then
         # The only file that can genuinely conflict is the binary database,
         # and GitHub's copy is the authoritative one: it holds the runs that
         # happened in the cloud, which this machine never saw.
@@ -212,11 +221,17 @@ if git ls-remote --exit-code origin HEAD >/dev/null 2>&1; then
           git add data/prices.db >/dev/null 2>&1 || true
           if ! git -c core.editor=true rebase --continue >/dev/null 2>&1; then
             git rebase --abort >/dev/null 2>&1 || true
-            die "Couldn't reconcile with GitHub. Run: git pull --rebase"
+            no "Couldn't reconcile with GitHub. Git said:"
+            printf "%s\n" "$rebase_err" | sed 's/^/     /' | head -8
+            die "Try: git pull --rebase"
           fi
           ok "Kept GitHub's price history (it has the cloud runs)"
         else
-          die "Rebase failed. Run: git pull --rebase"
+          # Not a conflict -- something stopped it starting. Show the reason
+          # instead of a bare "Rebase failed", which says nothing.
+          no "Rebase failed. Git said:"
+          printf "%s\n" "$rebase_err" | sed 's/^/     /' | head -8
+          die "Try: git pull --rebase"
         fi
       else
         ok "Rebased onto GitHub"
