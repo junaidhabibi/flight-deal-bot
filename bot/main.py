@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import traceback
+import uuid
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1043,8 +1044,12 @@ class FlightDealBot:
                 if self.emailer.send_deals(
                     urgent, urgent=True, max_deals=max_per_email
                 ):
+                    # One id for the whole message: the daily cap counts
+                    # messages, and it must not depend on how long this loop
+                    # takes to run.
+                    email_id = uuid.uuid4().hex
                     for d in urgent[:max_per_email]:
-                        self.hist.record_alert(d)
+                        self.hist.record_alert(d, email_id=email_id)
                     sent += 1
             except EmailError as e:
                 self._note_error(str(e))
@@ -1070,8 +1075,9 @@ class FlightDealBot:
                 if self.emailer.send_deals(
                     rest, urgent=False, rss_items=held_rss, max_deals=max_per_email
                 ):
+                    email_id = uuid.uuid4().hex
                     for d in rest[:max_per_email]:
-                        self.hist.record_alert(d)
+                        self.hist.record_alert(d, email_id=email_id)
                     rss_sent.extend(held_rss)
                     sent += 1
             except EmailError as e:

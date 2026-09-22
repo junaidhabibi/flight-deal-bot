@@ -42,9 +42,11 @@ CREATE TABLE IF NOT EXISTS alerts (
     price_usd     REAL NOT NULL,
     tier          TEXT NOT NULL,
     sent_at       TEXT NOT NULL,
-    payload       TEXT
+    payload       TEXT,
+    email_id      TEXT                     -- which message carried this deal
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_sent ON alerts(sent_at);
+CREATE INDEX IF NOT EXISTS idx_alerts_email ON alerts(email_id);
 
 CREATE TABLE IF NOT EXISTS runs (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,8 +94,39 @@ class History:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path))
         self._conn.row_factory = sqlite3.Row
+        # Before SCHEMA, not after: SCHEMA indexes a column an older file
+        # does not have yet, and CREATE INDEX on a missing column is a hard
+        # error that would make the bot unable to open its own database.
+        self._migrate()
         self._conn.executescript(SCHEMA)
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Bring a DB written by an older version up to the current schema.
+
+        The live database is committed back to the repo every run, so it is
+        always older than the code that opens it. CREATE TABLE IF NOT EXISTS
+        is a no-op on a table that already exists, which means a new column
+        in SCHEMA never reaches an existing file -- it has to be added here.
+        """
+        cur = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='alerts'"
+        )
+        if cur.fetchone() is None:
+            return  # Fresh file: SCHEMA is about to create it, correctly.
+        cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(alerts)").fetchall()
+        }
+        if "email_id" not in cols:
+            self._conn.execute("ALTER TABLE alerts ADD COLUMN email_id TEXT")
+            # Rows written before this column existed carry no message
+            # identity, so fall back to what the old code inferred: deals
+            # mailed together share a sent_at to the second.
+            self._conn.execute(
+                "UPDATE alerts SET email_id = 'legacy-' || substr(sent_at, 1, 19) "
+                "WHERE email_id IS NULL"
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -279,12 +312,19 @@ class History:
         )
         return cur.fetchone() is not None
 
-    def record_alert(self, deal: Deal) -> None:
+    def record_alert(self, deal: Deal, email_id: Optional[str] = None) -> None:
+        """Log a deal that was mailed. `email_id` names the message it rode in.
+
+        Callers that mail several deals in one message pass one id for all of
+        them; that is what makes the daily cap count messages instead of
+        deals. Without an id the deal is treated as its own message, because
+        nothing here can honestly claim otherwise.
+        """
         with self._tx() as c:
             c.execute(
                 "INSERT OR REPLACE INTO alerts "
-                "(fingerprint, route, price_usd, tier, sent_at, payload) "
-                "VALUES (?,?,?,?,?,?)",
+                "(fingerprint, route, price_usd, tier, sent_at, payload, email_id) "
+                "VALUES (?,?,?,?,?,?,?)",
                 (
                     deal.fingerprint(),
                     deal.history_key,
@@ -292,20 +332,30 @@ class History:
                     deal.tier,
                     _iso(_utcnow()),
                     json.dumps(deal.to_dict(), default=str),
+                    email_id or f"solo-{deal.fingerprint()}",
                 ),
             )
 
     def emails_sent_since(self, hours: int) -> int:
         """How many EMAILS went out, not how many deals were in them.
 
-        record_alert() writes a row per deal, so counting rows made one
-        email carrying 7 deals look like 7 emails and tripped the daily cap
-        instantly. Deals mailed together share a sent_at to the second, so
-        counting distinct timestamps counts messages.
+        record_alert() writes a row per deal, so counting rows made one email
+        carrying 7 deals look like 7 emails and tripped the daily cap
+        instantly -- the bot went silent for 24h right after finding a sale.
+
+        This counted distinct sent_at timestamps truncated to the second
+        instead, which is the same bug one layer down: the seven INSERTs are
+        a loop, and on a slow runner that loop crosses a second boundary, so
+        one email counts as two. Identity is now recorded, not inferred.
         """
         cutoff = _iso(_utcnow() - timedelta(hours=hours))
+        # COALESCE, not a bare column: the live DB is committed back every
+        # run, so rows written before email_id existed are still in it. They
+        # fall back to the old timestamp heuristic rather than to NULL, which
+        # DISTINCT would collapse to a single phantom email.
         cur = self._conn.execute(
-            "SELECT COUNT(DISTINCT substr(sent_at, 1, 19)) AS c "
+            "SELECT COUNT(DISTINCT COALESCE(email_id, 'legacy-' || "
+            "substr(sent_at, 1, 19))) AS c "
             "FROM alerts WHERE sent_at >= ?",
             (cutoff,),
         )

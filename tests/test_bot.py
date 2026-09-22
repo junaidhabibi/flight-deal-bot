@@ -9,6 +9,7 @@ import os
 import ssl
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from datetime import date, datetime, timedelta
@@ -1875,28 +1876,105 @@ class TestRSSLifecycle(unittest.TestCase):
 
 
 class TestDailyEmailCapCountsEmails(unittest.TestCase):
+    """The daily cap is a cap on MESSAGES. Counting alert rows instead meant
+    one email of 7 deals tripped a cap of 6 and gagged the bot for 24h --
+    right after a sale, which is when a follow-up error fare is likeliest.
+
+    The first fix counted distinct sent_at values truncated to the second,
+    which failed on a slow CI runner: the 7 INSERTs straddled a second
+    boundary and one email counted as two. So these tests go through
+    dispatch(), the path that actually mails, and none of them depend on how
+    fast the machine runs.
+    """
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.hist = History(f"{self.tmp.name}/cap.db")
+        os.environ["SERPAPI_KEY"] = "fake-key"
+        self.cfg = Config.load(Path(__file__).resolve().parents[1] / "config.yml")
+        self.cfg._d["storage"]["db_path"] = f"{self.tmp.name}/cap.db"
+        from bot.main import FlightDealBot
+        self.bot = FlightDealBot(self.cfg, dry_run=True)
+        self.bot.emailer.send_deals = (
+            lambda deals=(), urgent=False, rss_items=(), max_deals=12: True
+        )
+        # Everything mails immediately, so one dispatch == one message.
+        self.bot.scorer.should_alert_now = lambda d: True
+        self.hist = self.bot.hist
 
     def tearDown(self):
-        self.hist.close(); self.tmp.cleanup()
+        self.bot.close(); self.tmp.cleanup()
+        os.environ.pop("SERPAPI_KEY", None)
+
+    def _deals(self, dests):
+        # Different routes: record_alert keys on the fingerprint, so the same
+        # route seven times would be one row, not seven.
+        return [
+            Deal(origin="DFW", destination=d, destination_city=d,
+                 price_usd=400 + i, depart_date=date(2027, 1, 10),
+                 return_date=date(2027, 1, 20))
+            for i, d in enumerate(dests)
+        ]
 
     def test_one_email_of_seven_deals_counts_as_one(self):
-        # Seven DIFFERENT routes: record_alert keys on the fingerprint, so
-        # the same route seven times is one row, not seven.
-        for i, dest in enumerate(
-            ("ARN", "CPH", "OSL", "DUB", "LIS", "MXP", "ZRH")
-        ):
-            self.hist.record_alert(Deal(
-                origin="DFW", destination=dest, destination_city=dest,
-                price_usd=400 + i, depart_date=date(2027, 1, 10),
-                return_date=date(2027, 1, 20),
-            ))
+        deals = self._deals(("ARN", "CPH", "OSL", "DUB", "LIS", "MXP", "ZRH"))
+        self.assertEqual(self.bot.dispatch(deals, []), 1)
         self.assertEqual(self.hist.alerts_sent_since(24), 7)
         self.assertEqual(
             self.hist.emails_sent_since(24), 1,
             "7 deals in one email counted as 7 emails and gagged the bot",
+        )
+
+    def test_a_slow_insert_loop_is_still_one_email(self):
+        """The exact CI failure: the batch crosses a second boundary.
+
+        Identity is recorded now rather than inferred from the clock, so a
+        stalled loop cannot manufacture a second email.
+        """
+        real = self.hist.record_alert
+        calls = {"n": 0}
+
+        def slow(deal, email_id=None):
+            calls["n"] += 1
+            if calls["n"] == 4:
+                time.sleep(1.05)          # straddle the second boundary
+            return real(deal, email_id=email_id)
+
+        self.hist.record_alert = slow
+        self.bot.dispatch(self._deals(("ARN", "CPH", "OSL", "DUB", "LIS")), [])
+        self.assertEqual(self.hist.alerts_sent_since(24), 5)
+        self.assertEqual(
+            self.hist.emails_sent_since(24), 1,
+            "a slow loop split one email in two and ate the daily budget",
+        )
+
+    def test_two_separate_emails_count_as_two(self):
+        """The counter must still be able to count -- an undercount would
+        mean no cap at all."""
+        self.bot.dispatch(self._deals(("ARN", "CPH")), [])
+        self.bot.dispatch(self._deals(("OSL", "DUB")), [])
+        self.assertEqual(self.hist.emails_sent_since(24), 2)
+
+    def test_the_cap_stops_dispatch_at_the_limit(self):
+        cap = int(self.cfg.alerts.get("max_emails_per_day", 6))
+        pool = ("ARN", "CPH", "OSL", "DUB", "LIS", "MXP", "ZRH", "BCN",
+                "FCO", "AMS", "BRU", "VIE", "PRG", "WAW", "BUD")
+        for i in range(cap):
+            self.assertEqual(self.bot.dispatch(self._deals([pool[i]]), []), 1)
+        self.assertEqual(self.hist.emails_sent_since(24), cap)
+        self.assertEqual(
+            self.bot.dispatch(self._deals([pool[cap]]), []), 0,
+            "the cap did not hold",
+        )
+
+    def test_a_legacy_row_without_an_email_id_still_counts(self):
+        """A DB written before the column existed is committed back every
+        run, so the migration has to leave it countable."""
+        self.bot.dispatch(self._deals(("ARN", "CPH")), [])
+        self.hist._conn.execute("UPDATE alerts SET email_id = NULL")
+        self.hist._conn.commit()
+        self.assertEqual(
+            self.hist.emails_sent_since(24), 1,
+            "old alert rows went uncounted, so the cap stopped capping",
         )
 
 
