@@ -83,6 +83,19 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run tests
+        id: tests
+        # A scheduled scan runs code that has not changed since the previous
+        # scan, so a red suite there is almost always the environment, not
+        # the bot -- and on 2026-09-22 that cost a whole run: one assertion
+        # failed, every later step was skipped, and the bot was blind for
+        # four hours over a bug that could not affect a single fare.
+        #
+        # Tests still BLOCK a push or a manual run, which is when the code
+        # actually changed and shipping it broken could mail wrong prices.
+        # On a schedule they report instead of gagging the bot: the scan
+        # goes ahead, and the job is failed at the very end so GitHub still
+        # emails about it. Reporting, not silence -- and not blindness.
+        continue-on-error: ${{ github.event_name == 'schedule' }}
         run: python -m tests.test_bot
 
       - name: Check required secrets are set
@@ -205,3 +218,14 @@ jobs:
             fi
             echo "Price history pushed."
           fi
+
+      - name: Fail the run if the suite was red
+        # Last, deliberately. A scheduled run with failing tests still
+        # scans and still commits its price history above; this only makes
+        # the job end red, which is the thing that reaches an inbox.
+        if: ${{ always() && steps.tests.outcome == 'failure' }}
+        run: |
+          echo "::error::Tests failed. The scan was allowed to continue"
+          echo "because the code has not changed since the last green run,"
+          echo "but read the 'Run tests' step above -- something is wrong."
+          exit 1
