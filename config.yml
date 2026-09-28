@@ -563,6 +563,29 @@ sources:
     # verification sits comfortably inside it.
     daily_budget: 12
 
+    # Calibration: ask Google what a route NORMALLY costs, a couple of
+    # routes a day, and keep the answer per route. This is the benchmark
+    # every alert's "normally $X" line is measured against once it exists.
+    #
+    # Why it has to be a separate step: Google's typical range used to be
+    # fetched only while verifying a fare that had already cleared the
+    # discount bar. The bar is set against the bot's own last week of
+    # observations, and after a flat week that is just the current price --
+    # so nothing cleared it, so the range was never fetched, so nothing
+    # could ever clear it. Twelve days, sixty-two runs, zero verifications.
+    #
+    # Cost: calls_per_day out of the same allowance as the sweep, spent
+    # after the sweep and any verification, never into the reserve.
+    # 21 routes refreshed every 14 days is ~45 searches/month:
+    #   6 sweeps/day x 30 = 180, + 45 calibration = 225 of the 240 budget.
+    # Stockholm is sampled first (highest priority), then the rest by
+    # priority, then whichever sample is oldest.
+    calibration:
+      enabled: true
+      calls_per_day: 2
+      max_age_days: 14         # older than this and the benchmark falls
+                               # back to the bot's own history until refreshed
+
   rss:
     # Human-curated error-fare feeds. Free, no key, and the fastest signal
     # for genuine mistake fares. Matched against your origins/destinations.

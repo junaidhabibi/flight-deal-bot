@@ -77,6 +77,22 @@ CREATE TABLE IF NOT EXISTS seen_rss (
     guid          TEXT PRIMARY KEY,
     seen_at       TEXT NOT NULL
 );
+
+-- Google's own idea of what a route normally costs, one row per route.
+-- This is the only benchmark in the system that is not derived from the
+-- bot's own observations, and it is refreshed by the calibration step.
+CREATE TABLE IF NOT EXISTS route_insights (
+    route          TEXT PRIMARY KEY,       -- Deal.route, e.g. DFW-ARN
+    typical_low    REAL,
+    typical_high   REAL,
+    lowest_price   REAL,
+    price_level    TEXT,
+    history_min    REAL,
+    history_points INTEGER DEFAULT 0,
+    outbound_date  TEXT,                   -- the dates the sample was taken for
+    return_date    TEXT,
+    fetched_at     TEXT NOT NULL
+);
 """
 
 
@@ -367,6 +383,106 @@ class History:
             "SELECT COUNT(*) AS c FROM alerts WHERE sent_at >= ?", (cutoff,)
         )
         return int(cur.fetchone()["c"])
+
+    # ---------- Google route insights (calibration) ----------
+
+    def save_route_insight(
+        self,
+        route: str,
+        insight: Any,
+        outbound_date: Optional[str] = None,
+        return_date: Optional[str] = None,
+    ) -> None:
+        """Keep Google's typical range for a route. Replaces the old row.
+
+        `insight` is a PriceInsight; typed loosely to avoid importing the
+        SerpApi module into the storage layer.
+        """
+        with self._tx() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO route_insights "
+                "(route, typical_low, typical_high, lowest_price, price_level, "
+                " history_min, history_points, outbound_date, return_date, "
+                " fetched_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    route,
+                    insight.typical_low,
+                    insight.typical_high,
+                    insight.lowest_price,
+                    insight.price_level or "",
+                    insight.history_min,
+                    int(insight.history_points or 0),
+                    outbound_date,
+                    return_date,
+                    _iso(_utcnow()),
+                ),
+            )
+
+    def route_insight(
+        self, route: str, max_age_days: Optional[float] = None
+    ) -> Optional[Dict[str, Any]]:
+        """The stored Google range for a route, or None if missing or stale.
+
+        Returned as a plain dict (typical_low, typical_high, lowest_price,
+        price_level, history_min, history_points, fetched_at, age_days).
+        A row with no typical range is treated as absent: Google does not
+        publish one for every route/date, and a row that says nothing must
+        not be mistaken for a fresh answer.
+        """
+        cur = self._conn.execute(
+            "SELECT * FROM route_insights WHERE route = ?", (route,)
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        try:
+            fetched = datetime.fromisoformat(d["fetched_at"])
+        except (TypeError, ValueError):
+            return None
+        age = (_utcnow() - fetched).total_seconds() / 86400.0
+        d["age_days"] = age
+        if max_age_days is not None and age > max_age_days:
+            return None
+        if d.get("typical_low") is None or d.get("typical_high") is None:
+            return None
+        return d
+
+    def calibrations_since(self, hours: int) -> int:
+        """How many Google range samples were fetched in the window --
+        the pacing counter for the calibration budget."""
+        cutoff = _iso(_utcnow() - timedelta(hours=hours))
+        cur = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM route_insights WHERE fetched_at >= ?",
+            (cutoff,),
+        )
+        return int(cur.fetchone()["c"])
+
+    def insight_ages(self) -> Dict[str, float]:
+        """route -> age in days of its stored Google range (any row, even
+        one without a typical range, so a route Google won't price isn't
+        re-queried every single run)."""
+        out: Dict[str, float] = {}
+        now = _utcnow()
+        for r in self._conn.execute("SELECT route, fetched_at FROM route_insights"):
+            try:
+                fetched = datetime.fromisoformat(r["fetched_at"])
+            except (TypeError, ValueError):
+                continue
+            out[r["route"]] = (now - fetched).total_seconds() / 86400.0
+        return out
+
+    def latest_observation(self, route: str) -> Optional[Dict[str, Any]]:
+        """The most recent plain round-trip observation on a route -- the
+        itinerary (dates) a calibration query should be asked about."""
+        cur = self._conn.execute(
+            "SELECT origin, destination, depart_date, return_date, price_usd, "
+            "observed_at FROM observations WHERE route = ? "
+            "ORDER BY observed_at DESC LIMIT 1",
+            (route,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
 
     # ---------- api budget ----------
 

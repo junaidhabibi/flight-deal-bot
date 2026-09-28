@@ -615,6 +615,10 @@ class FlightDealBot:
         except Exception as e:
             self._note_error(f"RSS fetch failed: {e}")
             return []
+        for f in getattr(self.rss, "failures", []) or []:
+            # Per-feed failures are swallowed inside fetch_all so one dead
+            # blog can't take the others down; they still count as errors.
+            self._note_error(f"RSS feed failed: {redact(str(f))}")
 
         city_names = {
             d["code"]: d.get("city", d["code"]) for d in self.cfg.destinations
@@ -692,6 +696,17 @@ class FlightDealBot:
                     max_stops=self.cfg.trip.get("max_extra_stops", 1),
                 )
                 insights[deal.fingerprint()] = insight
+                # A verification is a calibration sample too: keep it, so
+                # the next run's benchmark for this route is Google's.
+                if deal.history_key == deal.route and insight.has_typical:
+                    self.hist.save_route_insight(
+                        deal.route,
+                        insight,
+                        outbound_date=deal.depart_date.isoformat(),
+                        return_date=(
+                            deal.return_date.isoformat() if deal.return_date else None
+                        ),
+                    )
                 log.info(
                     "Verified %s: Google typical %s-%s, level=%s",
                     deal.route,
@@ -713,6 +728,133 @@ class FlightDealBot:
                     self.hist.bump_api_calls("serpapi", spent)
 
         return insights
+
+    # ---------- calibration ----------
+
+    def calibration_plan(self) -> List[str]:
+        """Which routes to ask Google about, in order. No API spend here.
+
+        Every destination on the list, from the home origin. Routes with no
+        sample yet come first, by priority (Stockholm first); then routes
+        whose sample is older than max_age_days, stalest first. A route that
+        has a fresh sample is not in the plan at all.
+        """
+        cal = self.cfg.sources.get("serpapi", {}).get("calibration", {}) or {}
+        max_age = float(cal.get("max_age_days", 14))
+        home = str(self.cfg.thresholds.get("baseline_origin", "DFW")).upper()
+        ages = self.hist.insight_ages()
+
+        never: List[Tuple[float, str]] = []
+        stale: List[Tuple[float, str]] = []
+        for d in self.cfg.destinations:
+            route = f"{home}-{d['code']}"
+            age = ages.get(route)
+            if age is None:
+                never.append((-float(d.get("priority", 1.0)), route))
+            elif age > max_age:
+                stale.append((-age, route))
+        never.sort()
+        stale.sort()
+        return [r for _, r in never] + [r for _, r in stale]
+
+    def calibrate(self) -> int:
+        """Refresh Google's typical range for a couple of routes per day.
+
+        This is what makes the "normally costs" line in an alert mean
+        something. Google's range is the only benchmark here that is not
+        derived from the bot's own recent observations -- and without it the
+        bot can only compare a fare to last week, which after a flat week
+        means nothing short of an error fare can register.
+
+        It used to be fetched only while verifying a fare that had ALREADY
+        cleared the bar. Nothing cleared the bar, so it was never fetched:
+        the independent benchmark was gated behind the circular one.
+
+        Budget: calls_per_day out of the same SerpApi allowance the sweep
+        uses, spent only after the sweep and any verification have had
+        theirs, and never into the reserve. Returns searches spent.
+        """
+        if not self.serp:
+            return 0
+        s = self.cfg.sources.get("serpapi", {})
+        cal = s.get("calibration", {}) or {}
+        if not cal.get("enabled", True):
+            return 0
+
+        per_day = int(cal.get("calls_per_day", 2))
+        done_today = self.hist.calibrations_since(24)
+        allowance = max(0, per_day - done_today)
+        if allowance == 0:
+            log.info("Calibration: %d/%d samples already taken today.", done_today, per_day)
+            return 0
+
+        # Never dip into what a verification would need.
+        reserve = int(
+            self.cfg.sources.get("google_explore", {}).get("reserve_for_verification", 0)
+        )
+        room = self._serpapi_room(reserve=reserve)
+        n = min(allowance, room)
+        if n == 0:
+            log.info("Calibration: no SerpApi room today (reserve %d kept).", reserve)
+            return 0
+
+        plan = self.calibration_plan()
+        if not plan:
+            log.info("Calibration: every route has a fresh Google sample.")
+            return 0
+
+        spent = 0
+        for route in plan:
+            if spent >= n:
+                break
+            obs = self.hist.latest_observation(route)
+            if not obs:
+                # Never seen a fare on this route, so there are no dates to
+                # ask about. It gets a sample once the sweep has shown it.
+                continue
+            origin, dest = route.split("-", 1)
+            before = self.serp.call_count
+            try:
+                insight = self.serp.verify(
+                    origin=origin,
+                    destination=dest,
+                    outbound_date=obs["depart_date"],
+                    return_date=obs.get("return_date"),
+                    max_stops=self.cfg.trip.get("max_extra_stops", 1),
+                )
+            except SerpApiError as e:
+                self._note_error(f"SerpApi calibrate {route}: {e}")
+                break  # quota or key problem: stop burning calls
+            finally:
+                used = self.serp.call_count - before
+                if used > 0:
+                    self.hist.bump_api_calls("serpapi", used)
+                    spent += used
+
+            # Store even an empty answer, so a route Google will not price
+            # is retried on the normal refresh cycle, not every run.
+            self.hist.save_route_insight(
+                route, insight,
+                outbound_date=obs["depart_date"],
+                return_date=obs.get("return_date"),
+            )
+            stats = self.hist.route_stats(route)
+            if insight.has_typical:
+                log.info(
+                    "Calibrated %s: Google typical $%.0f-$%.0f (level=%s) "
+                    "vs this bot's p10 $%s over %d scans",
+                    route, insight.typical_low, insight.typical_high,
+                    insight.price_level or "?",
+                    f"{stats['p10']:.0f}" if stats.get("p10") else "-",
+                    int(stats.get("count") or 0),
+                )
+            else:
+                log.info(
+                    "Calibrated %s: Google published no typical range for "
+                    "%s/%s -- benchmark stays on this bot's history.",
+                    route, obs["depart_date"], obs.get("return_date"),
+                )
+        return spent
 
     # ---------- the run ----------
 
@@ -790,6 +932,14 @@ class FlightDealBot:
         log.info("Recorded %d observations", n_obs)
 
         sent = self.dispatch(final, rss_items, send_digest=send_digest)
+
+        # After the mail is out: refresh Google's benchmark for a route or
+        # two, using this run's dates. Last, so a quota problem here can't
+        # cost the sweep, the scoring or the email.
+        try:
+            self.calibrate()
+        except Exception as e:  # never let bookkeeping kill a finished run
+            self._note_error(f"calibration: {redact(str(e))}")
 
         self.hist.prune()
         self._check_for_silence(n_obs)
@@ -1117,15 +1267,33 @@ class FlightDealBot:
         if not routes:
             lines.append("No observations yet. Run the bot to start building history.")
         else:
-            lines.append(f"{'Route':<18}{'Obs':>6}{'Low':>10}{'P10':>10}{'Median':>10}")
-            lines.append("-" * 54)
+            lines.append(
+                f"{'Route':<18}{'Obs':>6}{'Low':>10}{'P10':>10}{'Median':>10}"
+                f"{'Google typical':>18}{'Age':>6}"
+            )
+            lines.append("-" * 78)
             for route, s in sorted(
                 routes.items(), key=lambda kv: kv[1]["min"] or 1e9
             ):
+                g = self.hist.route_insight(route)  # any age; the Age column says
+                if g:
+                    google = f"${g['typical_low']:,.0f}-${g['typical_high']:,.0f}"
+                    age = f"{g['age_days']:.0f}d"
+                else:
+                    google, age = "-", ""
                 lines.append(
                     f"{route:<18}{s['count']:>6}"
                     f"{s['min']:>10,.0f}{s['p10']:>10,.0f}{s['median']:>10,.0f}"
+                    f"{google:>18}{age:>6}"
                 )
+            lines.append("")
+            lines.append(
+                "  Google typical = what Google says the route normally costs;"
+            )
+            lines.append(
+                "  it is the benchmark for the discount when younger than "
+                f"{self.cfg.sources.get('serpapi', {}).get('calibration', {}).get('max_age_days', 14)} days."
+            )
 
         sp = self.cfg.sources.get("serpapi", {})
         used = self.hist.api_calls_this_month("serpapi")

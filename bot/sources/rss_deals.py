@@ -79,12 +79,18 @@ class RSSDealWatcher:
 
     def fetch_all(self) -> List[FeedItem]:
         items: List[FeedItem] = []
+        # A dead blog must never kill the run -- but it must not be silent
+        # either. A warning in a log nobody reads is how the bot's only
+        # human-curated source could be down for a month unnoticed. The
+        # caller surfaces these in the run's errors (and so in the emails).
+        self.failures: List[str] = []
         for feed in self.feeds:
             name = feed.get("name", feed.get("url", "feed"))
             try:
                 items.extend(self.fetch_feed(feed["url"], name))
-            except Exception as e:  # a dead blog must never kill the run
+            except Exception as e:
                 log.warning("RSS feed %s failed: %s", name, e)
+                self.failures.append(f"{name}: {e}")
         return items
 
     def fetch_feed(self, url: str, name: str = "") -> List[FeedItem]:

@@ -642,11 +642,24 @@ class TestScoring(unittest.TestCase):
         self.assertEqual(d2.typical_price, 620)
         self.assertIn("baseline", d2.typical_basis)
 
-    def test_history_beats_google_for_typical_price(self):
-        """Opposite of the benchmark rule: for 'normal', specific wins."""
+    def test_google_range_is_the_quoted_normal_when_present(self):
+        """This used to prefer the bot's own median for the "normally"
+        line while the discount beside it was computed against Google's
+        range -- two different numbers presented as one comparison. The
+        quoted normal and the benchmark now come from the same source,
+        and the bot's own median is stated alongside, not instead."""
         self.seed([600] * 10)
         d = self.make_deal(300)
         self.scorer.score(d, insight=PriceInsight(typical_low=400, typical_high=500))
+        self.assertEqual(d.reference_basis, "google_typical")
+        self.assertEqual(d.typical_price, 450)
+        self.assertIn("Google's typical range ($400-$500)", d.typical_basis)
+        self.assertIn("median over 10 scans is $600", d.typical_basis)
+
+    def test_history_is_the_quoted_normal_without_google(self):
+        self.seed([600] * 10)
+        d = self.make_deal(300)
+        self.scorer.score(d)
         self.assertEqual(d.typical_price, 600)
         self.assertIn("median", d.typical_basis)
 
@@ -2530,6 +2543,290 @@ class TestRSSRespectsYourOrigins(unittest.TestCase):
         self.assertIn("from: DFW", body)
         self.assertIn("not checked by this bot", body)
 
+
+
+
+# ======================================================================
+#  Calibration: Google's typical range as the benchmark.
+#
+#  Twelve days, 62 runs, zero candidates. The benchmark was the bot's own
+#  10th percentile over a flat week -- i.e. the current price -- so "18%
+#  under it" meant an error fare or nothing. Google's typical range, the
+#  only independent benchmark in the system, was fetched only while
+#  verifying a fare that had already cleared that bar. Never, therefore.
+# ======================================================================
+
+
+def _google(low, high, level="typical", hist_min=None):
+    from bot.sources.serpapi_verify import PriceInsight
+    return PriceInsight(typical_low=low, typical_high=high, price_level=level,
+                        history_min=hist_min, history_points=30 if hist_min else 0)
+
+
+def _days_ago(n):
+    from datetime import timezone as _tz
+    return (datetime.now(_tz.utc) - timedelta(days=n)).isoformat()
+
+
+class TestRouteInsightStorage(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.hist = History(f"{self.tmp.name}/cal.db")
+
+    def tearDown(self):
+        self.hist.close(); self.tmp.cleanup()
+
+    def test_round_trip(self):
+        self.hist.save_route_insight("DFW-ARN", _google(800, 1100, "low", 640),
+                                     "2027-01-10", "2027-01-20")
+        row = self.hist.route_insight("DFW-ARN")
+        self.assertEqual((row["typical_low"], row["typical_high"]), (800, 1100))
+        self.assertEqual(row["history_min"], 640)
+        self.assertLess(row["age_days"], 0.01)
+
+    def test_stale_sample_is_not_returned(self):
+        self.hist.save_route_insight("DFW-ARN", _google(800, 1100))
+        self.hist._conn.execute("UPDATE route_insights SET fetched_at = ?", (_days_ago(20),))
+        self.hist._conn.commit()
+        self.assertIsNone(self.hist.route_insight("DFW-ARN", max_age_days=14))
+        self.assertIsNotNone(self.hist.route_insight("DFW-ARN"),
+                             "with no max_age the row should still be readable")
+        self.assertAlmostEqual(self.hist.insight_ages()["DFW-ARN"], 20, delta=0.1)
+
+    def test_a_sample_without_a_range_counts_as_absent(self):
+        """Google does not publish a range for every route/date. An empty
+        answer must not become a benchmark, but it must still be recorded
+        so the route is not re-queried every run."""
+        from bot.sources.serpapi_verify import PriceInsight
+        self.hist.save_route_insight("DFW-GOT", PriceInsight())
+        self.assertIsNone(self.hist.route_insight("DFW-GOT"))
+        self.assertIn("DFW-GOT", self.hist.insight_ages())
+        self.assertEqual(self.hist.calibrations_since(24), 1)
+
+    def test_latest_observation_gives_the_dates_to_ask_about(self):
+        self.hist.record_observations([
+            Deal(origin="DFW", destination="ARN", destination_city="Stockholm",
+                 price_usd=600, depart_date=date(2027, 1, 1), return_date=date(2027, 1, 9)),
+        ])
+        obs = self.hist.latest_observation("DFW-ARN")
+        self.assertEqual(obs["depart_date"], "2027-01-01")
+        self.assertEqual(obs["return_date"], "2027-01-09")
+        self.assertIsNone(self.hist.latest_observation("DFW-XXX"))
+
+
+class TestGoogleRangeIsTheBenchmark(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SERPAPI_KEY"] = "fake-key"
+        self.cfg = Config.load(Path(__file__).resolve().parents[1] / "config.yml")
+        self.cfg._d["storage"]["db_path"] = f"{self.tmp.name}/bench.db"
+        from bot.main import FlightDealBot
+        self.bot = FlightDealBot(self.cfg, dry_run=True)
+        self.hist = self.bot.hist
+        # A flat week: 20 scans, all $567. The old benchmark == the price.
+        for i in range(20):
+            self.hist.record_observations([self._fare(567)])
+        # Push those observations into the past so exclude_recent doesn't hide them.
+        self.hist._conn.execute("UPDATE observations SET observed_at = ?", (_days_ago(2),))
+        self.hist._conn.commit()
+
+    def tearDown(self):
+        self.bot.close(); self.tmp.cleanup()
+        os.environ.pop("SERPAPI_KEY", None)
+
+    def _fare(self, price, dest="ARN"):
+        return Deal(origin="DFW", destination=dest, destination_city="Stockholm",
+                    price_usd=price, depart_date=date(2027, 1, 10),
+                    return_date=date(2027, 1, 20), source="test")
+
+    def test_flat_history_alone_cannot_produce_a_deal(self):
+        """The situation as it was: the same price for a week is 0% off."""
+        d = self.bot.scorer.score(self._fare(567))
+        self.assertEqual(d.reference_basis, "history")
+        self.assertLess(d.discount_pct, 1)
+        ok, why = self.bot.scorer.passes_filters(d)
+        self.assertFalse(ok, why)
+
+    def test_a_fresh_google_range_becomes_the_benchmark(self):
+        self.hist.save_route_insight("DFW-ARN", _google(800, 1100, "low"))
+        d = self.bot.scorer.score(self._fare(567))
+        self.assertEqual(d.reference_basis, "google_typical")
+        self.assertEqual(d.reference_price, 800)
+        self.assertAlmostEqual(d.discount_pct, (800 - 567) / 800 * 100, places=1)
+        self.assertTrue(d.is_record, "a flat price is still at its own record")
+        ok, why = self.bot.scorer.passes_filters(d)
+        self.assertTrue(ok, why)
+        # And the email's "normally" line quotes the same source.
+        self.assertIn("Google's typical range ($800-$1,100)", d.typical_basis)
+        self.assertIn("this bot's median over 20 scans is $567", d.typical_basis)
+        self.assertEqual(d.typical_price, 950)
+
+    def test_a_stored_range_does_not_claim_verification(self):
+        """A days-old calibration sample is not a live check of THIS fare."""
+        self.hist.save_route_insight("DFW-ARN", _google(800, 1100, "low"))
+        d = self.bot.scorer.score(self._fare(567))
+        self.assertFalse(d.verified_by, d.verified_by)
+        self.assertFalse(any("rates this price level" in n for n in d.notes))
+        d2 = self.bot.scorer.score(self._fare(567), insight=_google(800, 1100, "low"))
+        self.assertEqual(d2.verified_by, "serpapi")
+
+    def test_a_stale_range_falls_back_to_history(self):
+        self.hist.save_route_insight("DFW-ARN", _google(800, 1100))
+        self.hist._conn.execute("UPDATE route_insights SET fetched_at = ?", (_days_ago(30),))
+        self.hist._conn.commit()
+        d = self.bot.scorer.score(self._fare(567))
+        self.assertEqual(d.reference_basis, "history")
+
+    def test_a_stitched_stopover_is_not_measured_against_the_round_trip_range(self):
+        """Stopover itineraries are priced from separate one-ways and are
+        systematically cheaper; the round-trip range would flatter them."""
+        self.hist.save_route_insight("DFW-ARN", _google(800, 1100))
+        via = self._fare(400)
+        via.stopover_code = "HEL"
+        self.assertNotEqual(via.history_key, via.route)
+        self.assertIsNone(self.bot.scorer.stored_insight(via))
+
+    def test_google_range_cannot_lift_a_fare_over_the_ceiling(self):
+        """The ceiling is yours; a generous range doesn't waive it."""
+        self.hist.save_route_insight("DFW-ARN", _google(1200, 1500))
+        d = self.bot.scorer.score(self._fare(700))
+        self.assertGreater(d.discount_pct, 40)
+        ok, why = self.bot.scorer.passes_filters(d)
+        self.assertFalse(ok); self.assertIn("ceiling", why)
+
+
+class TestCalibrationStep(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SERPAPI_KEY"] = "fake-key"
+        self.cfg = Config.load(Path(__file__).resolve().parents[1] / "config.yml")
+        self.cfg._d["storage"]["db_path"] = f"{self.tmp.name}/calib.db"
+        from bot.main import FlightDealBot
+        self.bot = FlightDealBot(self.cfg, dry_run=True)
+        self.hist = self.bot.hist
+        # One observation on every listed route, so each has dates to ask about.
+        deals = [Deal(origin="DFW", destination=d["code"],
+                      destination_city=d.get("city", d["code"]),
+                      price_usd=600, depart_date=date(2027, 1, 10),
+                      return_date=date(2027, 1, 20), source="test")
+                 for d in self.cfg.destinations]
+        self.hist.record_observations(deals)
+        self.asked = []
+        self.answers = {}
+
+        def fake_verify(origin, destination, outbound_date, return_date=None, max_stops=None):
+            self.asked.append(f"{origin}-{destination}")
+            self.bot.serp.call_count += 1
+            return self.answers.get(destination, _google(800, 1100, "typical"))
+        self.bot.serp.verify = fake_verify
+
+    def tearDown(self):
+        self.bot.close(); self.tmp.cleanup()
+        os.environ.pop("SERPAPI_KEY", None)
+
+    def test_stockholm_is_sampled_first(self):
+        plan = self.bot.calibration_plan()
+        self.assertEqual(plan[0], "DFW-ARN")
+        pri = {f"DFW-{d['code']}": d.get("priority", 1.0) for d in self.cfg.destinations}
+        self.assertEqual(plan, sorted(plan, key=lambda r: -pri[r]),
+                         "unsampled routes should go in priority order")
+
+    def test_spends_calls_per_day_and_no_more(self):
+        per_day = int(self.cfg.sources["serpapi"]["calibration"]["calls_per_day"])
+        spent = self.bot.calibrate()
+        self.assertEqual(spent, per_day)
+        self.assertEqual(self.asked, self.bot_plan_head(per_day))
+        self.assertEqual(self.hist.api_calls_this_month("serpapi"), per_day,
+                         "calibration must be billed against the shared budget")
+        # A second run the same day spends nothing more.
+        self.assertEqual(self.bot.calibrate(), 0)
+        self.assertEqual(self.hist.api_calls_this_month("serpapi"), per_day)
+
+    def bot_plan_head(self, n):
+        pri = sorted(self.cfg.destinations, key=lambda d: -d.get("priority", 1.0))
+        return [f"DFW-{d['code']}" for d in pri[:n]]
+
+    def test_a_fresh_route_is_skipped_and_a_stale_one_refreshed(self):
+        self.hist.save_route_insight("DFW-ARN", _google(800, 1100))      # fresh
+        self.hist.save_route_insight("DFW-GOT", _google(700, 900))
+        self.hist._conn.execute(
+            "UPDATE route_insights SET fetched_at = ? WHERE route = 'DFW-GOT'",
+            (_days_ago(30),))
+        self.hist._conn.commit()
+        plan = self.bot.calibration_plan()
+        self.assertNotIn("DFW-ARN", plan)
+        # Never-sampled routes first (by priority), then the stale one.
+        self.assertEqual(plan[-1], "DFW-GOT")
+
+    def test_never_spends_into_the_verification_reserve(self):
+        s = self.cfg.sources["serpapi"]
+        daily = int(s["daily_budget"])
+        reserve = int(self.cfg.sources["google_explore"]["reserve_for_verification"])
+        self.hist.bump_api_calls("serpapi", daily - reserve)
+        self.assertEqual(self.bot.calibrate(), 0)
+        self.assertEqual(self.asked, [])
+
+    def test_stops_on_a_quota_error_and_records_it(self):
+        from bot.sources.serpapi_verify import SerpApiError
+        def boom(*a, **k):
+            raise SerpApiError("SerpApi monthly quota exhausted (429).")
+        self.bot.serp.verify = boom
+        self.assertEqual(self.bot.calibrate(), 0)
+        self.assertTrue(any("calibrate" in e and "429" in e for e in self.bot.errors))
+        self.assertEqual(self.hist.api_calls_this_month("serpapi"), 0,
+                         "a failed search is free and must not be billed")
+
+    def test_an_empty_answer_is_stored_so_the_route_is_not_hammered(self):
+        from bot.sources.serpapi_verify import PriceInsight
+        self.answers["ARN"] = PriceInsight()     # Google gave no range
+        self.bot.calibrate()
+        self.assertIn("DFW-ARN", self.hist.insight_ages())
+        self.assertIsNone(self.hist.route_insight("DFW-ARN"))
+        self.assertNotIn("DFW-ARN", self.bot.calibration_plan())
+
+    def test_a_route_with_no_observation_is_skipped_not_guessed(self):
+        self.hist._conn.execute("DELETE FROM observations WHERE destination='ARN'")
+        self.hist._conn.commit()
+        self.bot.calibrate()
+        self.assertNotIn("DFW-ARN", self.asked)
+
+    def test_verification_also_stores_the_sample(self):
+        d = Deal(origin="DFW", destination="ARN", destination_city="Stockholm",
+                 price_usd=400, depart_date=date(2027, 1, 10),
+                 return_date=date(2027, 1, 20), source="test")
+        self.bot.verify([d])
+        self.assertIsNotNone(self.hist.route_insight("DFW-ARN"))
+
+    def test_disabled_in_config_means_no_spend(self):
+        self.cfg._d["sources"]["serpapi"]["calibration"]["enabled"] = False
+        self.assertEqual(self.bot.calibrate(), 0)
+        self.assertEqual(self.asked, [])
+
+
+class TestRSSFeedFailureIsAnError(unittest.TestCase):
+    """A dead feed was a log.warning nobody would ever read."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SERPAPI_KEY"] = "fake-key"
+        self.cfg = Config.load(Path(__file__).resolve().parents[1] / "config.yml")
+        self.cfg._d["storage"]["db_path"] = f"{self.tmp.name}/rssfail.db"
+        from bot.main import FlightDealBot
+        self.bot = FlightDealBot(self.cfg, dry_run=True)
+
+    def tearDown(self):
+        self.bot.close(); self.tmp.cleanup()
+        os.environ.pop("SERPAPI_KEY", None)
+
+    def test_a_failed_feed_lands_in_the_run_errors(self):
+        import requests
+        def dead(url, name=""):
+            raise requests.RequestException("HTTP 503 from theflightdeal.com")
+        self.bot.rss.fetch_feed = dead
+        items = self.bot.scan_rss()
+        self.assertEqual(items, [])
+        self.assertTrue(any("RSS feed failed" in e and "503" in e for e in self.bot.errors),
+                        self.bot.errors)
 
 
 # ======================================================================

@@ -4,15 +4,24 @@ The honest problem: no public API sells "lowest price this route has ever
 been." Google shows price history in its UI but only exposes a partial
 series, and the fare caches only know the last 48 hours. So the bot builds
 its own record book -- every observation from every run goes into SQLite --
-and layers three independent reference prices on top:
+and layers three reference prices on top:
 
-  1. Its own history        (best, once there are enough observations)
-  2. Google's typical range (via SerpApi, on verified candidates)
+  1. Google's typical range (via SerpApi: fetched by the calibration step
+                             and stored per route, or live on a verified
+                             candidate)
+  2. Its own history        (the 10th percentile, once there are enough
+                             observations)
   3. Your seeded baseline   (config.yml, used on day one)
 
-The reference used is the LOWEST credible one, which makes the discount
-figure conservative: a fare has to beat the toughest benchmark available,
-not the most flattering one.
+Google's range wins when it is fresh, because it is the only one of the
+three that is not derived from the bot's own recent observations. The old
+rule -- lowest credible reference wins -- sounded conservative but had a
+failure mode that produced nothing at all: after a week of flat prices the
+bot's own 10th percentile IS the current price, so "18% below it" can only
+ever be an error fare, and a genuine seasonal low on a route that has been
+expensive all year is invisible. Between history and baseline, the lowest
+still wins, for the same reason as before: a hand-typed baseline must not
+be allowed to manufacture a discount out of thin air.
 """
 
 from __future__ import annotations
@@ -62,9 +71,27 @@ class DealScorer:
         count = int(stats["count"] or 0)
         min_obs = int(self.t.get("min_observations_for_history", 8))
 
+        # 1. Google's own idea of typical. Live from a verification, or the
+        #    stored sample the calibration step keeps per route. If present
+        #    and fresh it IS the reference -- see the module docstring.
+        insight = insight or self.stored_insight(deal)
+        if insight and insight.typical_low:
+            ref = Reference(
+                price=float(insight.typical_low),
+                basis="google_typical",
+                observations=insight.history_points,
+                record_price=insight.history_min,
+            )
+            # Our own all-time min is still the record bar, and the count
+            # says how much of our own data backs the email.
+            if stats["min"]:
+                ref.record_price = float(stats["min"])
+            ref.observations = max(ref.observations, count)
+            return ref
+
         candidates: List[Reference] = []
 
-        # 1. Our own history. Use the 10th percentile as "a good price" --
+        # 2. Our own history. Use the 10th percentile as "a good price" --
         #    the all-time min is the record bar, not the normal-price bar.
         if count >= min_obs and stats["p10"]:
             candidates.append(
@@ -73,17 +100,6 @@ class DealScorer:
                     basis="history",
                     observations=count,
                     record_price=float(stats["min"]) if stats["min"] else None,
-                )
-            )
-
-        # 2. Google's own idea of typical, when we bothered to verify.
-        if insight and insight.typical_low:
-            candidates.append(
-                Reference(
-                    price=float(insight.typical_low),
-                    basis="google_typical",
-                    observations=insight.history_points,
-                    record_price=insight.history_min,
                 )
             )
 
@@ -118,6 +134,30 @@ class DealScorer:
         best.observations = max(best.observations, count)
         return best
 
+    def stored_insight(self, deal: Deal) -> Optional[PriceInsight]:
+        """Google's stored typical range for this deal's route, if fresh.
+
+        Only for a plain round trip. Google's range describes the city pair
+        as one product; a stitched stopover (history_key != route) is priced
+        from separate one-ways and is systematically cheaper, so measuring
+        it against the round-trip range would flatter every stopover.
+        """
+        if deal.history_key != deal.route:
+            return None
+        cal = self.cfg.sources.get("serpapi", {}).get("calibration", {}) or {}
+        max_age = float(cal.get("max_age_days", 14))
+        row = self.hist.route_insight(deal.route, max_age_days=max_age)
+        if not row:
+            return None
+        return PriceInsight(
+            lowest_price=row.get("lowest_price"),
+            price_level=row.get("price_level") or "",
+            typical_low=row.get("typical_low"),
+            typical_high=row.get("typical_high"),
+            history_min=row.get("history_min"),
+            history_points=int(row.get("history_points") or 0),
+        )
+
     # ---------- scoring ----------
 
     def score(
@@ -127,6 +167,12 @@ class DealScorer:
         exclude_recent_seconds: int = 0,
     ) -> Deal:
         """Fill in discount, tier, record status and priority score."""
+        # A live insight comes from verifying THIS fare on Google just now.
+        # A stored one is the route's calibration sample, days old. Both
+        # can set the benchmark; only the live one may claim "verified".
+        live = insight
+        insight = insight or self.stored_insight(deal)
+
         ref = self.reference_for(deal, insight, exclude_recent_seconds)
         deal.reference_price = ref.price
         deal.reference_basis = ref.basis
@@ -161,9 +207,17 @@ class DealScorer:
 
         # Google cross-check, when we have it.
         if insight:
-            deal.verified_by = "serpapi"
-            if insight.price_level:
-                deal.notes.append(f"Google rates this price level: {insight.price_level}")
+            if live:
+                deal.verified_by = "serpapi"
+                if live.price_level:
+                    deal.notes.append(
+                        f"Google rates this price level: {live.price_level}"
+                    )
+                if live.best_offer and live.best_offer > price * 1.25:
+                    deal.notes.append(
+                        f"Google's cheapest bookable right now is "
+                        f"${live.best_offer:,.0f} -- cached fare may be gone"
+                    )
             beats = insight.beats_history(price, tol)
             if beats is False:
                 deal.notes.append(
@@ -171,10 +225,12 @@ class DealScorer:
                 )
             elif beats is True:
                 deal.notes.append("At or below the lowest price in Google's history")
-            if insight.best_offer and insight.best_offer > price * 1.25:
+            # Say how much of OUR data sits behind the comparison, so a
+            # persistent price reads as what it is.
+            if deal.observations and deal.previous_record is not None:
                 deal.notes.append(
-                    f"Google's cheapest bookable right now is "
-                    f"${insight.best_offer:,.0f} -- cached fare may be gone"
+                    f"Cheapest this bot has seen in {deal.observations} scans: "
+                    f"${deal.previous_record:,.0f}"
                 )
 
         deal.tier = self._tier(deal.discount_pct)
@@ -198,9 +254,12 @@ class DealScorer:
         that as "normal" would understate what you'd actually have paid.
         The median is the honest answer to "what does this usually run?".
 
-        Preference order is most-specific-first here, the opposite of the
-        benchmark logic: real observations on this exact route beat Google's
-        route-level range, which beats a hand-entered baseline.
+        Google's range comes first when we have it. The bot's own median
+        used to, but with a short history that median IS the current price:
+        the email would say "$567 -- normally $567" and the discount line
+        beside it would say 25% off, computed against a benchmark the
+        reader could not see. The quoted "normal" and the benchmark must
+        be the same number, or the comparison is not honest.
         """
         window = self.t.get("history_window_days") or None
         stats = self.hist.route_stats(deal.history_key, window_days=window)
@@ -210,13 +269,6 @@ class DealScorer:
         if insight and insight.typical_low and insight.typical_high:
             deal.typical_low = insight.typical_low
             deal.typical_high = insight.typical_high
-
-        if count >= min_obs and stats["median"]:
-            deal.typical_price = round(float(stats["median"]), 2)
-            deal.typical_basis = f"median of {count} observations"
-            return
-
-        if insight and insight.typical_low and insight.typical_high:
             deal.typical_price = round(
                 (insight.typical_low + insight.typical_high) / 2, 2
             )
@@ -224,6 +276,16 @@ class DealScorer:
                 f"Google's typical range "
                 f"(${insight.typical_low:,.0f}-${insight.typical_high:,.0f})"
             )
+            if count:
+                deal.typical_basis += (
+                    f"; this bot's median over {count} scans is "
+                    f"${float(stats['median']):,.0f}"
+                )
+            return
+
+        if count >= min_obs and stats["median"]:
+            deal.typical_price = round(float(stats["median"]), 2)
+            deal.typical_basis = f"median of {count} observations"
             return
 
         baseline = self._baseline_for(deal)
