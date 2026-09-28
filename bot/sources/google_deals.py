@@ -34,6 +34,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import requests
 
+from ..layovers import register_airport
 from ..models import Deal, Leg
 
 log = logging.getLogger(__name__)
@@ -436,6 +437,12 @@ class GoogleTravelExplore:
 
         city = (city_lookup or {}).get(code) or row.get("name") or code
 
+        # Where it is, so the layover estimator can judge flights to places
+        # that were never on the list (see layovers.register_airport).
+        gps = row.get("gps_coordinates") or {}
+        if isinstance(gps, dict):
+            register_airport(code, gps.get("latitude"), gps.get("longitude"))
+
         leg = Leg(
             origin=origin,
             destination=code,
@@ -450,6 +457,7 @@ class GoogleTravelExplore:
             origin=origin,
             destination=code,
             destination_city=city,
+            destination_country=str(row.get("country") or ""),
             price_usd=price,
             depart_date=depart,
             return_date=ret,
@@ -475,21 +483,38 @@ class GoogleTravelExplore:
             travel_duration=travel_duration, max_stops=max_stops,
             max_price=max_price, carry_on_bags=carry_on_bags,
         )
+        # wanted_destinations=None means everything Google returns. That is
+        # the default now: the list in config.yml sets PRIORITY (Stockholm
+        # first), not scope. It used to set scope, and 27 real European
+        # fares a run were thrown away unrecorded.
         wanted = {d.upper() for d in (wanted_destinations or [])}
+        listed = {k.upper() for k in (city_lookup or {})}
 
-        deals, elsewhere = [], 0
+        deals: List[Deal] = []
+        skipped = on_list = 0
+        no_fare = 0
         for row in rows:
             d = self.to_deal(row, origin, city_lookup)
             if not d:
+                # No flight price, airport code or date: Google lists some
+                # places it can't sell a flight to (a train or a drive from
+                # the nearest airport). Counted so the log adds up.
+                no_fare += 1
                 continue
             if wanted and d.destination not in wanted:
-                elsewhere += 1
+                skipped += 1
                 continue
+            if d.destination in listed:
+                on_list += 1
             deals.append(d)
 
         log.info(
-            "Google Explore %s->Europe (month=%s): %d destinations, "
-            "%d on your list, %d elsewhere in Europe",
-            origin, month or "any", len(rows), len(deals), elsewhere,
+            "Google Explore %s->Europe (month=%s): %d places returned, "
+            "%d with a flight fare (%d on your priority list, %d elsewhere)"
+            "%s, %d with no flight fare",
+            origin, month or "any", len(rows), len(deals) + skipped,
+            on_list, len(deals) - on_list,
+            f", {skipped} filtered out" if skipped else "",
+            no_fare,
         )
         return deals

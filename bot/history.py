@@ -472,6 +472,40 @@ class History:
             out[r["route"]] = (now - fetched).total_seconds() / 86400.0
         return out
 
+    def cheapest_routes(
+        self, origin: str, days: int = 14, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Plain round-trip routes from `origin` seen in the last `days`,
+        cheapest first: route, destination, low (cheapest in the window), n.
+
+        Stitched stopovers are excluded (stopover IS NOT NULL).
+        """
+        cutoff = _iso(_utcnow() - timedelta(days=days))
+        cur = self._conn.execute(
+            "SELECT route, destination, MIN(price_usd) AS low, COUNT(*) AS n "
+            "FROM observations WHERE origin = ? AND observed_at >= ? "
+            "AND stopover IS NULL GROUP BY route ORDER BY low LIMIT ?",
+            (origin.upper(), cutoff, limit),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def cheapest_observation(
+        self, route: str, days: int = 14
+    ) -> Optional[Dict[str, Any]]:
+        """The cheapest recent observation on a route -- the itinerary worth
+        asking Google about, since it is the one that could alert. Fares on
+        these routes swing a lot run to run (Stockholm: $567-$750 in one
+        week), so the latest observation is often not the relevant one."""
+        cutoff = _iso(_utcnow() - timedelta(days=days))
+        cur = self._conn.execute(
+            "SELECT origin, destination, depart_date, return_date, price_usd, "
+            "observed_at FROM observations WHERE route = ? AND observed_at >= ? "
+            "ORDER BY price_usd ASC, observed_at DESC LIMIT 1",
+            (route, cutoff),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
     def latest_observation(self, route: str) -> Optional[Dict[str, Any]]:
         """The most recent plain round-trip observation on a route -- the
         itinerary (dates) a calibration query should be asked about."""

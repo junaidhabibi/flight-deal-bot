@@ -238,7 +238,7 @@ class Emailer:
                     f"+ ${d.bag_fee_usd:,.0f} carry-on "
                     f"({d.ticket_count} ticket{'s' if d.ticket_count > 1 else ''})"
                 )
-            lines.append(f"   Route:      {d.origin} -> {d.destination_city} ({d.destination})")
+            lines.append(f"   Route:      {d.origin} -> {self._place(d)} ({d.destination})")
             if d.stopover_city:
                 days = (d.stopover_hours or 0) / 24
                 lines.append(
@@ -300,7 +300,7 @@ class Emailer:
 
             lines.append(
                 f"   Discount:   {d.discount_pct:.0f}% below "
-                f"${d.reference_price:,.0f} (the alert threshold)"
+                f"${d.reference_price:,.0f} ({self._reference_label(d)})"
             )
             lines.append(f"   Benchmark:  {self._basis_label(d)}")
             if d.is_record:
@@ -381,6 +381,27 @@ class Emailer:
         lines.append("    if you can, don't call to ask about it, and wait a week")
         lines.append("    before booking hotels.")
         return "\n".join(lines)
+
+    @staticmethod
+    def _reference_label(d: Deal) -> str:
+        """What the number the discount is measured from actually is.
+
+        It used to be called "the alert threshold" whatever it was -- but
+        it is a benchmark, and the threshold is a percentage below it."""
+        return {
+            "google_typical": "bottom of Google's typical range",
+            "history": f"a good price over this bot's last {d.observations} scans",
+            "baseline": "your configured baseline",
+            "ceiling": "your price ceiling",
+        }.get(d.reference_basis, d.reference_basis or "benchmark")
+
+    @staticmethod
+    def _place(d: Deal) -> str:
+        """'Edinburgh, United Kingdom' for places you didn't pick yourself."""
+        c = (getattr(d, "destination_country", "") or "").strip()
+        if c and c.lower() not in (d.destination_city or "").lower():
+            return f"{d.destination_city}, {c}"
+        return d.destination_city
 
     @staticmethod
     def _basis_label(d: Deal) -> str:
@@ -471,7 +492,7 @@ class Emailer:
                 )
             parts.append(
                 f'<div class="route">{_esc(d.origin)} &rarr; '
-                f"{_esc(d.destination_city)}{via}</div>"
+                f"{_esc(self._place(d))}{via}</div>"
             )
 
             if d.typical_price:
@@ -544,8 +565,9 @@ class Emailer:
                     f'<div><span class="lbl">Airline</span>{_esc(d.airline)}</div>'
                 )
             parts.append(
-                f'<div><span class="lbl">Threshold</span>'
-                f"{d.discount_pct:.0f}% below ${d.reference_price:,.0f}</div>"
+                f'<div><span class="lbl">Discount</span>'
+                f"{d.discount_pct:.0f}% below ${d.reference_price:,.0f} "
+                f"({_esc(self._reference_label(d))})</div>"
             )
             parts.append(
                 f'<div><span class="lbl">Benchmark</span>'

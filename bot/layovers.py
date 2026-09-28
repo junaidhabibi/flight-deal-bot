@@ -233,6 +233,32 @@ AIRPORTS: Dict[str, Tuple[float, float]] = {
     "BUD": (47.4369, 19.2556),
 }
 
+def register_airport(code: str, lat: Optional[float], lon: Optional[float]) -> bool:
+    """Teach the estimator where an airport is, if it doesn't know already.
+
+    The table above covers the destinations that were on the list. With
+    the whole of Europe in scope, most destinations are not in it, and an
+    airport with no coordinates makes every layover to it "couldn't be
+    estimated" -- flagged, never rejected. The layover rule would silently
+    stop applying to anywhere off the original list.
+
+    Google's Explore response carries each destination's gps_coordinates
+    (the city, not the runway -- a few minutes of flying at most, well
+    inside the estimate's margin). A known airport is never overwritten.
+    """
+    code = (code or "").upper()
+    if not code or code in AIRPORTS:
+        return False
+    try:
+        la, lo = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return False
+    if not (-90 <= la <= 90 and -180 <= lo <= 180):
+        return False
+    AIRPORTS[code] = (la, lo)
+    return True
+
+
 EARTH_RADIUS_KM = 6371.0
 
 # Typical cruise speed for a jet on these routes, plus fixed time on the

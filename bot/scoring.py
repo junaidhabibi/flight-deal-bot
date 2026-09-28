@@ -383,9 +383,12 @@ class DealScorer:
             no_history = deal.previous_record is None
             floor = self.t.get("no_history_alert_tier", "great")
             if no_history and tier_rank(deal.tier) >= tier_rank(floor):
+                vs = {"google_typical": "Google's typical range",
+                      "baseline": "your baseline"}.get(deal.reference_basis,
+                                                       "the benchmark")
                 deal.notes.append(
                     "No price history for this route yet -- alerting anyway "
-                    "because the discount vs. your baseline is extreme."
+                    f"because the discount vs. {vs} is extreme."
                 )
                 return True, ""
             return False, "not a record fare"

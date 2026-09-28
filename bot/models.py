@@ -43,6 +43,7 @@ class Deal:
     price_usd: float
     depart_date: date
     return_date: Optional[date] = None
+    destination_country: str = ""   # from Google, for places off the list
 
     # Stopover detail (None for a plain round trip).
     stopover_code: Optional[str] = None

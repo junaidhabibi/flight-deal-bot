@@ -42,6 +42,9 @@ class FeedItem:
     matched_origins: List[str] = field(default_factory=list)
     matched_destinations: List[str] = field(default_factory=list)
     matched_cities: List[str] = field(default_factory=list)
+    # Names a European country or city at all -- the scope test now that
+    # every European destination is in scope, not just the list.
+    europe_places: List[str] = field(default_factory=list)
     is_hot: bool = False
     # Set when the post says the fare applies from many/most US cities, in
     # which case it is worth seeing even without a named origin match.
@@ -168,6 +171,7 @@ class RSSDealWatcher:
         hot_keywords: Sequence[str] = (),
         origin_city_names: Sequence[str] = (),
         origin_aliases: Optional[Dict[str, Sequence[str]]] = None,
+        europe_extra: Sequence[str] = (),
     ) -> List[FeedItem]:
         """Tag each item with price, matched routes and hotness."""
         hot = [k.lower() for k in hot_keywords]
@@ -205,6 +209,9 @@ class RSSDealWatcher:
             item.matched_cities = [
                 city_names.get(c, c) for c in item.matched_destinations
             ]
+            item.europe_places = europe_places(
+                lower, list(europe_extra) + list(city_names.values())
+            )
             out.append(item)
         return out
 
@@ -215,6 +222,7 @@ class RSSDealWatcher:
         require_destination: bool = True,
         seen: Optional[Set[str]] = None,
         require_origin: bool = True,
+        europe_wide: bool = False,
     ) -> List[FeedItem]:
         """Filter down to items worth putting in front of a human.
 
@@ -237,9 +245,13 @@ class RSSDealWatcher:
                     continue
 
             if require_destination and not item.matched_destinations:
+                if europe_wide:
+                    # Anywhere in Europe counts, not just the list.
+                    if not item.europe_places:
+                        continue
                 # An explicit error/mistake fare post still gets through if it
                 # at least mentions Europe -- those are worth a look regardless.
-                if not (item.is_hot and "europe" in item.text.lower()):
+                elif not (item.is_hot and "europe" in item.text.lower()):
                     continue
             if (
                 max_price is not None
@@ -250,6 +262,55 @@ class RSSDealWatcher:
             keep.append(item)
         keep.sort(key=lambda i: (-i.relevance(), i.price_usd or 1e9))
         return keep
+
+
+# ---------- Europe vocabulary ----------
+
+# What a headline has to name to count as "somewhere in Europe". Countries,
+# plus the cities US deal posts actually use. Left out on purpose: names
+# that are more often somewhere in the US in a post written for Americans
+# (Georgia, Jersey, Birmingham, Manchester, Florence, Naples). A missed
+# post is a smaller cost than an email about Athens, Georgia.
+EUROPE_COUNTRIES = (
+    "Albania", "Andorra", "Armenia", "Austria", "Azerbaijan", "Belarus",
+    "Belgium", "Bosnia", "Bulgaria", "Croatia", "Cyprus", "Czech Republic",
+    "Czechia", "Denmark", "Estonia", "Finland", "France", "Germany", "Greece",
+    "Hungary", "Iceland", "Ireland", "Italy", "Kosovo", "Latvia",
+    "Lithuania", "Luxembourg", "Malta", "Moldova", "Monaco", "Montenegro",
+    "Netherlands", "Holland", "North Macedonia", "Norway", "Poland",
+    "Portugal", "Romania", "Serbia", "Slovakia", "Slovenia", "Spain",
+    "Sweden", "Switzerland", "Turkey", "Türkiye", "Ukraine",
+    "United Kingdom", "England", "Scotland", "Wales", "Northern Ireland",
+    "Europe", "Scandinavia",
+)
+EUROPE_CITIES = (
+    "Amsterdam", "Athens", "Barcelona", "Belgrade", "Bergen", "Berlin",
+    "Bologna", "Bordeaux", "Bratislava", "Brussels", "Bucharest", "Budapest",
+    "Catania", "Cologne", "Copenhagen", "Dubrovnik", "Dublin", "Dusseldorf",
+    "Düsseldorf", "Edinburgh", "Faro", "Frankfurt", "Geneva", "Glasgow",
+    "Gothenburg", "Hamburg", "Helsinki", "Istanbul", "Krakow", "Kraków",
+    "Lisbon", "Ljubljana", "London", "Lyon", "Madrid", "Malaga", "Málaga",
+    "Marseille", "Milan", "Munich", "Nice", "Oslo", "Palermo", "Palma",
+    "Paris", "Porto", "Prague", "Reykjavik", "Riga", "Rome", "Seville",
+    "Sofia", "Split", "Stockholm", "Tallinn", "Tbilisi", "Valencia",
+    "Venice", "Vienna", "Vilnius", "Warsaw", "Zagreb", "Zurich", "Zürich",
+)
+
+
+def europe_places(lower_text: str, extra: Sequence[str] = ()) -> List[str]:
+    """The European countries/cities a headline names, whole words only.
+
+    `extra` takes city names Google has returned for the Europe sweep, so a
+    place Explore knows about is recognised even if it isn't listed here.
+    """
+    found = []
+    for name in tuple(EUROPE_COUNTRIES) + tuple(EUROPE_CITIES) + tuple(extra or ()):
+        n = (name or "").strip()
+        if len(n) < 3:
+            continue
+        if re.search(rf"(?<!\w){re.escape(n.lower())}(?!\w)", lower_text):
+            found.append(n)
+    return sorted(set(found))
 
 
 # ---------- helpers ----------

@@ -2829,6 +2829,311 @@ class TestRSSFeedFailureIsAnError(unittest.TestCase):
                         self.bot.errors)
 
 
+
+# ======================================================================
+#  All of Europe, not just the list.
+#
+#  The destination list used to set SCOPE: Google returned ~46 European
+#  fares a run and the bot kept the 19 on the list, discarding the rest
+#  unrecorded. It now sets PRIORITY only. Everything that assumed "on the
+#  list" had to be checked: the layover estimator only knew 36 airports,
+#  the RSS filter only passed listed cities, the calibration plan and the
+#  heartbeat only looked at the list.
+# ======================================================================
+
+
+def _explore_row(code, name, price, lat=None, lon=None, country="", stops=1, minutes=720):
+    row = {"destination_airport": {"code": code}, "name": name, "country": country,
+           "flight_price": price, "start_date": "2027-01-10", "end_date": "2027-01-20",
+           "number_of_stops": stops, "flight_duration": minutes, "airline_code": "XX"}
+    if lat is not None:
+        row["gps_coordinates"] = {"latitude": lat, "longitude": lon}
+    return row
+
+
+class TestExploreKeepsAllOfEurope(unittest.TestCase):
+    def _client(self, rows):
+        from bot.sources.google_deals import GoogleTravelExplore
+        c = GoogleTravelExplore("fake")
+        c.explore = lambda **k: rows
+        return c
+
+    def test_unlisted_destinations_are_kept(self):
+        rows = [_explore_row("ARN", "Stockholm", 567),
+                _explore_row("EDI", "Edinburgh", 480, 55.95, -3.19, "United Kingdom"),
+                {"name": "Cinque Terre", "car_duration": 120}]          # no flight fare
+        c = self._client(rows)
+        with self.assertLogs("bot.sources.google_deals", level="INFO") as cm:
+            deals = c.scan(origin="DFW", wanted_destinations=None,
+                           city_lookup={"ARN": "Stockholm"})
+        self.assertEqual(sorted(d.destination for d in deals), ["ARN", "EDI"])
+        edi = [d for d in deals if d.destination == "EDI"][0]
+        self.assertEqual(edi.destination_city, "Edinburgh")
+        self.assertEqual(edi.destination_country, "United Kingdom")
+        log_line = " ".join(cm.output)
+        self.assertIn("3 places returned", log_line)
+        self.assertIn("1 on your priority list, 1 elsewhere", log_line)
+        self.assertIn("1 with no flight fare", log_line)
+
+    def test_a_wanted_list_still_filters_when_asked(self):
+        rows = [_explore_row("ARN", "Stockholm", 567), _explore_row("EDI", "Edinburgh", 480)]
+        deals = self._client(rows).scan(origin="DFW", wanted_destinations=["ARN"],
+                                        city_lookup={"ARN": "Stockholm"})
+        self.assertEqual([d.destination for d in deals], ["ARN"])
+
+
+class TestLayoverRuleReachesUnlistedAirports(unittest.TestCase):
+    def setUp(self):
+        from bot import layovers
+        self.layovers = layovers
+        self.saved = dict(layovers.AIRPORTS)
+
+    def tearDown(self):
+        self.layovers.AIRPORTS.clear()
+        self.layovers.AIRPORTS.update(self.saved)
+
+    def test_register_does_not_overwrite_or_accept_garbage(self):
+        L = self.layovers
+        arn = L.AIRPORTS["ARN"]
+        self.assertFalse(L.register_airport("ARN", 0, 0))
+        self.assertEqual(L.AIRPORTS["ARN"], arn)
+        self.assertFalse(L.register_airport("ZZZ", "north", None))
+        self.assertFalse(L.register_airport("ZZZ", 123, 0))      # lat out of range
+        self.assertTrue(L.register_airport("krk", 50.06, 19.94))
+        self.assertIn("KRK", L.AIRPORTS)
+
+    def test_without_coordinates_the_rule_cannot_judge(self):
+        """The failure this fixes: an unknown airport is waved through as
+        'couldn't be estimated', so the layover rule silently didn't apply."""
+        L = self.layovers
+        rules = L.LayoverRules()
+        est = L.assess_api_layover("DFW", "KRK", total_minutes=16 * 60,
+                                   transfers=1, rules=rules)
+        self.assertIsNone(est.hours)
+        self.assertFalse(est.confident)
+
+    def test_explore_coordinates_let_the_rule_reject_a_dead_zone_layover(self):
+        from bot.sources.google_deals import GoogleTravelExplore
+        L = self.layovers
+        # DFW->KRK is ~9,000 km: ~11.5h of flying. 20h door to door with
+        # one stop is an ~8h layover -- the dead zone the rule exists for.
+        row = _explore_row("KRK", "Krakow", 450, 50.06, 19.94, "Poland",
+                           stops=1, minutes=20 * 60)
+        GoogleTravelExplore.to_deal(row, "DFW")
+        est = L.assess_api_layover("DFW", "KRK", total_minutes=20 * 60,
+                                   transfers=1, rules=L.LayoverRules(), margin_hours=2.5)
+        self.assertIsNotNone(est.hours)
+        self.assertEqual(est.band, L.DEAD_ZONE)
+        self.assertTrue(est.confident, est.reason)
+
+
+class TestScanExploreScope(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SERPAPI_KEY"] = "fake-key"
+        self.cfg = Config.load(Path(__file__).resolve().parents[1] / "config.yml")
+        self.cfg._d["storage"]["db_path"] = f"{self.tmp.name}/scope.db"
+        from bot.main import FlightDealBot
+        self.bot = FlightDealBot(self.cfg, dry_run=True)
+        self.calls = []
+        def fake_scan(**kw):
+            self.calls.append(kw)
+            return []
+        self.bot.explore.scan = fake_scan
+
+    def tearDown(self):
+        self.bot.close(); self.tmp.cleanup()
+        os.environ.pop("SERPAPI_KEY", None)
+
+    def test_default_is_all_of_europe(self):
+        self.bot.scan_explore()
+        self.assertIsNone(self.calls[0]["wanted_destinations"])
+
+    def test_the_switch_restores_list_only(self):
+        self.cfg._d["sources"]["google_explore"]["all_of_europe"] = False
+        self.bot.scan_explore()
+        self.assertEqual(self.calls[0]["wanted_destinations"], self.cfg.destination_codes)
+
+    def test_every_sweep_is_from_dallas(self):
+        """Two of six sweeps used to go to Chicago and Austin."""
+        rot = self.cfg.sources["google_explore"]["rotation"]
+        self.assertTrue(rot)
+        self.assertEqual({r["origin"] for r in rot}, {"DFW"})
+
+
+class TestCalibrationAcrossEurope(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SERPAPI_KEY"] = "fake-key"
+        self.cfg = Config.load(Path(__file__).resolve().parents[1] / "config.yml")
+        self.cfg._d["storage"]["db_path"] = f"{self.tmp.name}/eu.db"
+        from bot.main import FlightDealBot
+        self.bot = FlightDealBot(self.cfg, dry_run=True)
+        self.hist = self.bot.hist
+        ceiling = float(self.cfg.thresholds["max_price_usd"])
+        def fare(code, price):
+            return Deal(origin="DFW", destination=code, destination_city=code,
+                        price_usd=price, depart_date=date(2027, 1, 10),
+                        return_date=date(2027, 1, 20), source="test")
+        self.hist.record_observations([
+            fare("ARN", ceiling - 50),   # listed, priority 2.0
+            fare("EDI", ceiling - 150),  # unlisted, cheap
+            fare("KRK", ceiling - 100),  # unlisted
+            fare("LHR", ceiling + 150),  # listed, above the ceiling
+            fare("TFS", ceiling + 300),  # unlisted, above the ceiling
+        ])
+
+    def tearDown(self):
+        self.bot.close(); self.tmp.cleanup()
+        os.environ.pop("SERPAPI_KEY", None)
+
+    def test_plan_covers_unlisted_routes_under_the_ceiling(self):
+        plan = self.bot.calibration_plan()
+        self.assertEqual(plan[0], "DFW-ARN", "your list still goes first")
+        self.assertEqual(plan[1:], ["DFW-EDI", "DFW-KRK"], "then the rest, cheapest first")
+
+    def test_a_route_that_swings_is_judged_on_its_recent_low(self):
+        """Caught on live data: Stockholm's latest fare was $706 but it had
+        been $567 that week. Filtering on the LATEST fare planned zero
+        routes. The one that could alert is the cheap one."""
+        ceiling = float(self.cfg.thresholds["max_price_usd"])
+        self.hist.record_observations([Deal(
+            origin="DFW", destination="ARN", destination_city="Stockholm",
+            price_usd=ceiling + 80, depart_date=date(2027, 2, 1),
+            return_date=date(2027, 2, 15), source="test")])
+        self.assertIn("DFW-ARN", self.bot.calibration_plan())
+        asked = []
+        def fake_verify(origin, destination, outbound_date, return_date=None, max_stops=None):
+            asked.append((destination, outbound_date, return_date))
+            self.bot.serp.call_count += 1
+            return _google(800, 1100)
+        self.bot.serp.verify = fake_verify
+        self.bot.calibrate()
+        self.assertEqual(asked[0], ("ARN", "2027-01-10", "2027-01-20"),
+                         "should ask about the cheap itinerary, not the latest")
+
+    def test_routes_above_the_ceiling_are_not_worth_a_search(self):
+        plan = self.bot.calibration_plan()
+        self.assertNotIn("DFW-LHR", plan)
+        self.assertNotIn("DFW-TFS", plan)
+
+    def test_calibration_never_eats_the_rest_of_the_months_sweeps(self):
+        from unittest.mock import patch
+        import bot.main as bm
+        monthly = int(self.cfg.sources["serpapi"]["monthly_budget"])
+        # The 20th of a 30-day month: 11 days x 6 sweeps = 66 must stay free.
+        fake_now = datetime(2026, 9, 20, 15, 0)
+        class FakeDT(datetime):
+            @classmethod
+            def utcnow(cls):
+                return fake_now
+        with patch.object(bm, "datetime", FakeDT):
+            self.hist.bump_api_calls("serpapi", monthly - 67)   # 67 left
+            self.assertEqual(self.bot._calibration_room(2), 1)
+            self.hist.bump_api_calls("serpapi", 1)               # 66 left
+            self.assertEqual(self.bot._calibration_room(2), 0)
+
+    def test_early_in_the_month_calibration_is_not_throttled(self):
+        from unittest.mock import patch
+        import bot.main as bm
+        class FakeDT(datetime):
+            @classmethod
+            def utcnow(cls):
+                return datetime(2026, 10, 2, 15, 0)
+        with patch.object(bm, "datetime", FakeDT):
+            self.assertEqual(self.bot._calibration_room(2), 2)
+
+    def test_an_unlisted_route_uses_google_once_sampled(self):
+        self.hist.save_route_insight("DFW-EDI", _google(700, 950, "low"))
+        d = Deal(origin="DFW", destination="EDI", destination_city="Edinburgh",
+                 price_usd=470, depart_date=date(2027, 1, 10),
+                 return_date=date(2027, 1, 20), source="test")
+        self.bot.scorer.score(d)
+        self.assertEqual(d.reference_basis, "google_typical")
+        self.assertGreater(d.discount_pct, 30)
+
+    def test_an_unlisted_route_with_nothing_to_compare_stays_quiet(self):
+        """No baseline, no history, no Google: the honest answer is silence,
+        not a discount measured against the ceiling."""
+        d = Deal(origin="DFW", destination="BGY", destination_city="Bergamo",
+                 price_usd=300, depart_date=date(2027, 1, 10),
+                 return_date=date(2027, 1, 20), source="test")
+        self.bot.scorer.score(d)
+        ok, why = self.bot.scorer.passes_filters(d)
+        self.assertFalse(ok)
+        self.assertIn("no price history", why)
+
+
+class TestRSSAcrossEurope(unittest.TestCase):
+    def _items(self, *titles):
+        from bot.sources.rss_deals import FeedItem, RSSDealWatcher
+        w = RSSDealWatcher([])
+        items = [FeedItem(guid=str(i), title=t, link="x", summary="", published=None)
+                 for i, t in enumerate(titles)]
+        items = w.annotate(items, origin_codes=["DFW"], destination_codes=["ARN"],
+                           city_names={"ARN": "Stockholm"},
+                           origin_aliases={"DFW": ["Dallas", "DFW"]})
+        return w, items
+
+    def test_an_unlisted_european_city_from_dallas_gets_through(self):
+        w, items = self._items("Dallas to Edinburgh, Scotland - $389 roundtrip")
+        kept = w.relevant(items, max_price=625, europe_wide=True)
+        self.assertEqual(len(kept), 1)
+        self.assertIn("Edinburgh", kept[0].europe_places)
+
+    def test_it_would_have_been_dropped_before(self):
+        w, items = self._items("Dallas to Edinburgh, Scotland - $389 roundtrip")
+        self.assertEqual(w.relevant(items, max_price=625, europe_wide=False), [])
+
+    def test_not_europe_is_still_out(self):
+        w, items = self._items("Dallas to Cancun - $189 roundtrip",
+                               "Dallas to Tokyo - $599 roundtrip")
+        self.assertEqual(w.relevant(items, max_price=625, europe_wide=True), [])
+
+    def test_not_dallas_is_still_out(self):
+        w, items = self._items("Boston to Edinburgh - $299 roundtrip")
+        self.assertEqual(w.relevant(items, max_price=625, europe_wide=True), [])
+
+    def test_whole_words_only(self):
+        from bot.sources.rss_deals import europe_places
+        self.assertEqual(europe_places("dallas to nicely priced ports"), [])
+        self.assertEqual(europe_places("dallas to nice, france $450"), ["France", "Nice"])
+
+
+class TestHeartbeatUsesTheRealBenchmark(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SERPAPI_KEY"] = "fake-key"
+        self.cfg = Config.load(Path(__file__).resolve().parents[1] / "config.yml")
+        self.cfg._d["storage"]["db_path"] = f"{self.tmp.name}/hb.db"
+        from bot.main import FlightDealBot
+        self.bot = FlightDealBot(self.cfg, dry_run=True)
+        self.sent = []
+        self.bot.emailer.send = lambda subject, body, *a, **k: self.sent.append(body) or True
+
+    def tearDown(self):
+        self.bot.close(); self.tmp.cleanup()
+        os.environ.pop("SERPAPI_KEY", None)
+
+    def test_close_to_alerting_is_measured_against_google_when_sampled(self):
+        self.bot.hist.record_observations([
+            Deal(origin="DFW", destination="ARN", destination_city="Stockholm",
+                 price_usd=567, depart_date=date(2027, 1, 10),
+                 return_date=date(2027, 1, 20), source="test"),
+            Deal(origin="DFW", destination="EDI", destination_city="Edinburgh",
+                 price_usd=480, depart_date=date(2027, 1, 10),
+                 return_date=date(2027, 1, 20), source="test"),
+        ])
+        self.bot.hist.save_route_insight("DFW-ARN", _google(800, 1100))
+        self.bot.heartbeat()
+        body = self.sent[-1]
+        pct = float(self.cfg.thresholds["min_discount_pct"])
+        needs = min(800 * (1 - pct / 100), float(self.cfg.thresholds["max_price_usd"]))
+        self.assertRegex(body, rf"Stockholm\s+best \$\s*567\s+needs \$\s*{needs:,.0f}.*vs Google")
+        self.assertIn("EDI", body, "the cheapest unlisted routes are shown too")
+        self.assertIn("no benchmark yet", body)
+
+
 # ======================================================================
 #  NOTE: this block must stay at the very END of the file.
 #

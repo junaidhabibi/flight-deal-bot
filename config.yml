@@ -489,6 +489,11 @@ sources:
     enabled: true
     area_id: "/m/02j9z"          # Europe, as a Google Knowledge Graph ID
     calls_per_run: 1
+    # Every European destination Google returns, not just the list above.
+    # The destination list sets PRIORITY (Stockholm scores 2x, and is
+    # calibrated first); it no longer sets scope. It used to, and ~27 real
+    # European fares a run were discarded without even being recorded.
+    all_of_europe: true
     # Held back from the daily budget so verification isn't starved by the
     # sweep. See _serpapi_room in main.py.
     reserve_for_verification: 2
@@ -497,18 +502,18 @@ sources:
     # and a rejected request still costs a search. apply_baggage adds the
     # fee instead, which is the tested path.
     price_with_carry_on: false
-    # One entry per run, cycling. Seven runs a day against a six-entry
-    # cycle means the lap advances by one slot each day rather than
-    # repeating -- which is fine, and spreads each origin across different
-    # times of day over a week.
-    # duration: 2 = about a week away, 3 = about two weeks.
+    # One entry per run, cycling. duration: 2 = about a week away,
+    # 3 = about two weeks.
+    #
+    # Dallas only. This used to spend two of every six sweeps -- a third
+    # of the SerpApi allowance -- on Chicago and Austin, after Junaid said
+    # he flies out of Dallas. Chicago wasn't even among the origins above,
+    # and it is the market that produced the "ORD->KEF 40% off" false
+    # alarm. Six DFW sweeps a day means every European fare from Dallas is
+    # seen six times a day instead of four.
     rotation:
       - {origin: DFW, duration: 2}
       - {origin: DFW, duration: 3}
-      - {origin: DFW, duration: 2}
-      - {origin: ORD, duration: 3}   # much cheaper to Europe; worth a look
-      - {origin: DFW, duration: 3}
-      - {origin: AUS, duration: 2}
 
   travelpayouts:
     # DISABLED 2026-09-19, after diagnosis rather than a guess.
@@ -574,17 +579,27 @@ sources:
     # so nothing cleared it, so the range was never fetched, so nothing
     # could ever clear it. Twelve days, sixty-two runs, zero verifications.
     #
-    # Cost: calls_per_day out of the same allowance as the sweep, spent
-    # after the sweep and any verification, never into the reserve.
-    # 21 routes refreshed every 14 days is ~45 searches/month:
-    #   6 sweeps/day x 30 = 180, + 45 calibration = 225 of the 240 budget.
-    # Stockholm is sampled first (highest priority), then the rest by
-    # priority, then whichever sample is oldest.
+    # Which routes: every European route from Dallas whose latest fare is
+    # at or under max_price_usd. A route above the ceiling can't alert
+    # whatever its benchmark says, so calibrating it buys nothing -- that
+    # is what keeps "all of Europe" inside the free tier. Never-sampled
+    # routes first (your list by priority, Stockholm first; then the rest
+    # cheapest first), then the stalest sample.
+    #
+    # Cost: at most calls_per_day, out of the same allowance as the sweep.
+    #   6 sweeps/day x 30 = 180, + up to 2/day x 30 = 60  ->  240 at most.
+    # That is the whole budget on paper, so calibration yields: it never
+    # spends into today's verification reserve, and never into the
+    # searches the sweep will need for the rest of the month
+    # (sweeps_per_day x days left). The sweep, the only fare source,
+    # always goes first. In practice the plan is usually smaller than
+    # 2/day -- only routes under the ceiling are in it.
     calibration:
       enabled: true
       calls_per_day: 2
       max_age_days: 14         # older than this and the benchmark falls
                                # back to the bot's own history until refreshed
+      sweeps_per_day: 6        # protected for the rest of the month
 
   rss:
     # Human-curated error-fare feeds. Free, no key, and the fastest signal

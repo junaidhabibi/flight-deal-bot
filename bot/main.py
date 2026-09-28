@@ -421,7 +421,9 @@ class FlightDealBot:
         want = min(want, room)
 
         cities = {d["code"]: d["city"] for d in self.cfg.destinations}
-        wanted = self.cfg.destination_codes
+        # All of Europe unless config says otherwise. The destination list
+        # sets priority (Stockholm scores 2x); it no longer sets scope.
+        wanted = None if cfg.get("all_of_europe", True) else self.cfg.destination_codes
         # Off by default: the `bags` parameter is documented but unverified
         # against the live Explore engine, and a rejected request costs a
         # search either way. The carry-on is priced in by apply_baggage
@@ -461,7 +463,12 @@ class FlightDealBot:
                 break  # a key or quota problem won't resolve itself this run
             deals.extend(found)
 
-        log.info("Europe sweep: %d fares to destinations on your list", len(deals))
+        listed = set(self.cfg.destination_codes)
+        n_listed = sum(1 for d in deals if d.destination in listed)
+        log.info(
+            "Europe sweep: %d fares (%d to your priority list, %d elsewhere in Europe)",
+            len(deals), n_listed, len(deals) - n_listed,
+        )
         return deals
 
     def scan_direct_routes(self) -> List[Deal]:
@@ -645,6 +652,9 @@ class FlightDealBot:
             annotated,
             max_price=self.cfg.thresholds.get("max_price_usd"),
             seen=seen,
+            europe_wide=bool(
+                self.cfg.sources.get("google_explore", {}).get("all_of_europe", True)
+            ),
         )
         # NOT marked seen here. Marking on FETCH meant an item found by a
         # non-digest run (6 of every 7) was recorded as seen, never emailed,
@@ -734,28 +744,65 @@ class FlightDealBot:
     def calibration_plan(self) -> List[str]:
         """Which routes to ask Google about, in order. No API spend here.
 
-        Every destination on the list, from the home origin. Routes with no
-        sample yet come first, by priority (Stockholm first); then routes
-        whose sample is older than max_age_days, stalest first. A route that
-        has a fresh sample is not in the plan at all.
+        Every European route the sweep has shown from the home origin in the
+        last two weeks -- but only those that have been at or under your
+        price ceiling in that time. A route that never gets under the
+        ceiling cannot alert whatever its benchmark says, so a search spent
+        calibrating it buys nothing. (The recent LOW, not the latest fare:
+        these fares swing -- Stockholm ran $567-$750 in one week -- and the
+        first version of this used the latest one and planned nothing.)
+        That one rule is what makes "all of Europe" affordable on 250
+        searches a month: most of the continent sits above $625.
+
+        Order: routes never sampled come first -- your priority list first
+        (Stockholm), then everything else cheapest first -- then routes
+        whose sample is older than max_age_days, stalest first. A route
+        with a fresh sample is not in the plan at all.
         """
         cal = self.cfg.sources.get("serpapi", {}).get("calibration", {}) or {}
         max_age = float(cal.get("max_age_days", 14))
         home = str(self.cfg.thresholds.get("baseline_origin", "DFW")).upper()
+        ceiling = float(self.cfg.thresholds.get("max_price_usd", 10**9))
         ages = self.hist.insight_ages()
+        priority = {d["code"]: float(d.get("priority", 1.0)) for d in self.cfg.destinations}
 
-        never: List[Tuple[float, str]] = []
+        never: List[Tuple[Tuple[float, float], str]] = []
         stale: List[Tuple[float, str]] = []
-        for d in self.cfg.destinations:
-            route = f"{home}-{d['code']}"
+        for r in self.hist.cheapest_routes(home, days=14):
+            if r.get("low") is None or float(r["low"]) > ceiling:
+                continue
+            route = r["route"]
             age = ages.get(route)
             if age is None:
-                never.append((-float(d.get("priority", 1.0)), route))
+                # Listed destinations by priority, then the rest by price.
+                key = (-priority.get(r["destination"], 0.0), float(r["low"]))
+                never.append((key, route))
             elif age > max_age:
                 stale.append((-age, route))
         never.sort()
         stale.sort()
         return [r for _, r in never] + [r for _, r in stale]
+
+    def _calibration_room(self, want: int) -> int:
+        """Searches calibration may spend without starving the sweep.
+
+        The daily cap and the verification reserve are handled by
+        _serpapi_room. This adds the monthly view: the sweep is the only
+        fare source, so the searches it will need for the rest of the month
+        are set aside first. Late in a heavy month calibration therefore
+        stops on its own rather than leaving the last days with no sweep.
+        """
+        cal = self.cfg.sources.get("serpapi", {}).get("calibration", {}) or {}
+        s = self.cfg.sources.get("serpapi", {})
+        monthly = int(s.get("monthly_budget", 220))
+        left_month = max(0, monthly - self.hist.api_calls_this_month("serpapi"))
+        sweeps_per_day = int(cal.get("sweeps_per_day", 6))
+        now = datetime.utcnow()
+        # Days left in the month INCLUDING today's remaining runs.
+        nxt = (now.replace(day=28) + timedelta(days=4)).replace(day=1)
+        days_left = (nxt.date() - now.date()).days
+        protected = days_left * sweeps_per_day
+        return max(0, min(want, left_month - protected))
 
     def calibrate(self) -> int:
         """Refresh Google's typical range for a couple of routes per day.
@@ -788,14 +835,18 @@ class FlightDealBot:
             log.info("Calibration: %d/%d samples already taken today.", done_today, per_day)
             return 0
 
-        # Never dip into what a verification would need.
+        # Never dip into what a verification would need today, nor into
+        # what the sweep will need for the rest of the month.
         reserve = int(
             self.cfg.sources.get("google_explore", {}).get("reserve_for_verification", 0)
         )
         room = self._serpapi_room(reserve=reserve)
-        n = min(allowance, room)
+        n = self._calibration_room(min(allowance, room))
         if n == 0:
-            log.info("Calibration: no SerpApi room today (reserve %d kept).", reserve)
+            log.info(
+                "Calibration: no SerpApi room (reserve %d kept today; "
+                "the rest of the month's sweeps come first).", reserve,
+            )
             return 0
 
         plan = self.calibration_plan()
@@ -807,7 +858,8 @@ class FlightDealBot:
         for route in plan:
             if spent >= n:
                 break
-            obs = self.hist.latest_observation(route)
+            # Ask about the cheap itinerary: it's the one that could alert.
+            obs = self.hist.cheapest_observation(route, days=14)
             if not obs:
                 # Never seen a fare on this route, so there are no dates to
                 # ask about. It gets a sample once the sweep has shown it.
@@ -1016,27 +1068,45 @@ class FlightDealBot:
         L.append("  thresholds have drifted out of reach and need lowering.")
         L.append("")
         home = str(self.cfg.thresholds.get("baseline_origin", "DFW")).upper()
-        watch = sorted(
-            self.cfg.destinations,
-            key=lambda d: -float(d.get("priority", 1.0)),
-        )[:8]
+        # Your top priorities, plus the cheapest of everything else -- the
+        # places most likely to alert are the ones worth watching here.
+        listed = {d["code"]: d for d in self.cfg.destinations}
+        top = [d["code"] for d in sorted(
+            self.cfg.destinations, key=lambda d: -float(d.get("priority", 1.0))
+        )[:6]]
+        others = [
+            r["destination"] for r in self.hist.cheapest_routes(
+                home, days=7, limit=12
+            ) if r["destination"] not in listed
+        ][:4]
+        min_disc = float(self.cfg.thresholds.get("min_discount_pct", 0))
+        ceiling = float(self.cfg.thresholds["max_price_usd"])
         any_row = False
-        for d in watch:
-            key = f"{home}-{d['code']}"
+        for code in top + others:
+            key = f"{home}-{code}"
             st = self.hist.route_stats(key)
             if not st["count"]:
                 continue
             any_row = True
-            base = self.cfg.baseline(d["code"]) or 0
-            gate = min(
-                base * (1 - float(self.cfg.thresholds["tiers"]["watch"]) / 100),
-                float(self.cfg.thresholds["max_price_usd"]),
-            ) if base else float(self.cfg.thresholds["max_price_usd"])
+            # The SAME benchmark the scorer uses right now -- Google's range
+            # if fresh, else this bot's history, else the baseline. This
+            # used to be computed from the seeded baseline alone, which
+            # stopped being the benchmark once anything better existed.
+            probe = Deal(origin=home, destination=code, destination_city=code,
+                         price_usd=float(st["min"]), depart_date=date.today())
+            ref = self.scorer.reference_for(probe)
+            if ref.basis == "ceiling":
+                gate, basis = ceiling, "no benchmark yet"
+            else:
+                gate = min(ref.price * (1 - min_disc / 100), ceiling)
+                basis = {"google_typical": "vs Google", "history": "vs own history",
+                         "baseline": "vs baseline"}.get(ref.basis, ref.basis)
             low = float(st["min"])
             gap = (low - gate) / gate * 100 if gate else 0
+            name = (listed.get(code) or {}).get("city") or code
             L.append(
-                f"  {d['city'][:16]:<16} best ${low:>6,.0f}   needs ${gate:>6,.0f}"
-                f"   ({gap:+.0f}%)   {st['count']} seen"
+                f"  {name[:16]:<16} best ${low:>6,.0f}   needs ${gate:>6,.0f}"
+                f"   ({gap:+.0f}%)   {basis}"
             )
         if not any_row:
             L.append("  No price history yet. Normal in the first week.")
@@ -1263,6 +1333,11 @@ class FlightDealBot:
                     s = self.hist.route_stats(key)
                     if s["count"]:
                         routes[key] = s
+        # Everything else in Europe the sweep has priced from home.
+        home = str(self.cfg.thresholds.get("baseline_origin", "DFW")).upper()
+        for r in self.hist.cheapest_routes(home, days=3650, limit=500):
+            if r["route"] not in routes:
+                routes[r["route"]] = self.hist.route_stats(r["route"])
 
         if not routes:
             lines.append("No observations yet. Run the bot to start building history.")
