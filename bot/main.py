@@ -32,6 +32,7 @@ from .scoring import DealScorer
 from .sources.google_deals import (
     AREA_EUROPE,
     DURATION_ONE_WEEK,
+    GoogleDealsEmpty,
     GoogleDealsError,
     GoogleTravelExplore,
 )
@@ -431,7 +432,12 @@ class FlightDealBot:
         bags = 1 if cfg.get("price_with_carry_on", False) else None
 
         deals: List[Deal] = []
-        for i in range(want):
+        # One extra try, on the next rotation slot, when Google comes back
+        # empty -- that is transient and the other trip length usually has
+        # fares. Only if the budget allows; never more than one.
+        retries_left = 1 if len(rotation) > 1 else 0
+        i = 0
+        while i < want:
             slot = rotation[(self.run_index + i) % len(rotation)]
             origin = str(slot.get("origin", self.cfg.origins[0]["code"])).upper()
             duration = int(slot.get("duration", DURATION_ONE_WEEK))
@@ -447,6 +453,15 @@ class FlightDealBot:
                     max_stops=self.cfg.trip.get("max_extra_stops", 1),
                     carry_on_bags=bags,
                 )
+            except GoogleDealsEmpty as e:
+                log.warning(
+                    "Europe sweep %s (duration %d): Google returned nothing "
+                    "this time -- %s", origin, duration, redact(str(e)),
+                )
+                found = []
+                if retries_left and self._serpapi_room(reserve=reserve) > 0:
+                    retries_left -= 1
+                    want += 1  # try the next slot in the rotation
             except GoogleDealsError as e:
                 self._note_error(f"Europe sweep {origin} (duration {duration}): {e}")
                 found, failed = [], True
@@ -462,6 +477,7 @@ class FlightDealBot:
             if failed:
                 break  # a key or quota problem won't resolve itself this run
             deals.extend(found)
+            i += 1
 
         listed = set(self.cfg.destination_codes)
         n_listed = sum(1 for d in deals if d.destination in listed)

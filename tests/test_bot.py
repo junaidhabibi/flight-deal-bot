@@ -1688,6 +1688,55 @@ class TestEuropeSweep(unittest.TestCase):
         self.bot.scan_explore()
         self.assertEqual(len(attempts), 1, "kept burning searches after a 429")
 
+    def test_empty_results_is_not_an_error_and_tries_the_next_slot(self):
+        """SerpApi reports "Empty results" through its error field. It is
+        transient (about one run in ten) and used to fail the whole run."""
+        from bot.sources.google_deals import GoogleDealsEmpty
+        seen = []
+
+        def flaky(**kw):
+            seen.append(kw["travel_duration"])
+            if len(seen) == 1:
+                raise GoogleDealsEmpty('Empty results for departure_id: "DFW"')
+            return []
+
+        self.bot.explore.scan = flaky
+        self.bot.run_index = 0
+        self.bot.scan_explore()
+        rotation = self.cfg.sources["google_explore"]["rotation"]
+        self.assertEqual(seen, [rotation[0]["duration"], rotation[1]["duration"]])
+        self.assertEqual(self.bot.errors, [])
+
+    def test_empty_results_retries_only_once(self):
+        from bot.sources.google_deals import GoogleDealsEmpty
+        attempts = []
+
+        def empty(**kw):
+            attempts.append(kw)
+            raise GoogleDealsEmpty("Empty results")
+
+        self.bot.explore.scan = empty
+        self.bot.scan_explore()
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(self.bot.errors, [])
+
+    def test_serpapi_empty_message_maps_to_the_empty_error(self):
+        from bot.sources.google_deals import GoogleDealsEmpty, GoogleDealsError
+
+        class R:
+            status_code = 200
+            def __init__(self, msg): self.msg = msg
+            def json(self): return {"error": self.msg}
+
+        self.bot.explore.session.get = lambda *a, **k: R(
+            'Empty results for departure_id: "DFW" and arrival_area_id: "/m/02j9z".')
+        with self.assertRaises(GoogleDealsEmpty):
+            self.bot.explore.explore(origin="DFW")
+        self.bot.explore.session.get = lambda *a, **k: R("Invalid API key.")
+        with self.assertRaises(GoogleDealsError) as cm:
+            self.bot.explore.explore(origin="DFW")
+        self.assertNotIsInstance(cm.exception, GoogleDealsEmpty)
+
     def test_successful_sweep_is_billed_once_per_call(self):
         self.cfg.sources["google_explore"]["calls_per_run"] = 2
 
