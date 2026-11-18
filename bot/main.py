@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -32,6 +33,7 @@ from .scoring import DealScorer
 from .sources.google_deals import (
     AREA_EUROPE,
     DURATION_ONE_WEEK,
+    GoogleDealsEmpty,
     GoogleDealsError,
     GoogleTravelExplore,
 )
@@ -95,6 +97,12 @@ class FlightDealBot:
         self.cfg = config
         self.dry_run = dry_run
         self.errors: List[str] = []
+        # Problems outside the bot's control that clear up on their own (a
+        # blog answering 403, Google briefly returning nothing). Recorded
+        # in the run history and listed in the weekly check-in, but they do
+        # NOT fail the GitHub run -- failing it sent a "run failed" email
+        # every day or two for things nobody could fix.
+        self.warnings: List[str] = []
 
         self.hist = History(config.db_path)
         self.scorer = DealScorer(config, self.hist)
@@ -324,6 +332,11 @@ class FlightDealBot:
         log.warning(msg)
         self.errors.append(msg)
 
+    def _note_warning(self, msg: str) -> None:
+        msg = redact(str(msg))
+        log.warning(msg)
+        self.warnings.append(msg)
+
     # ---------- scanning ----------
 
     # ---------- rotation ----------
@@ -431,7 +444,12 @@ class FlightDealBot:
         bags = 1 if cfg.get("price_with_carry_on", False) else None
 
         deals: List[Deal] = []
-        for i in range(want):
+        # One extra try, on the next rotation slot, when Google comes back
+        # empty -- that is transient and the other trip length usually has
+        # fares. Only if the budget allows; never more than one.
+        retries_left = 1 if len(rotation) > 1 else 0
+        i = 0
+        while i < want:
             slot = rotation[(self.run_index + i) % len(rotation)]
             origin = str(slot.get("origin", self.cfg.origins[0]["code"])).upper()
             duration = int(slot.get("duration", DURATION_ONE_WEEK))
@@ -447,6 +465,15 @@ class FlightDealBot:
                     max_stops=self.cfg.trip.get("max_extra_stops", 1),
                     carry_on_bags=bags,
                 )
+            except GoogleDealsEmpty as e:
+                self._note_warning(
+                    f"Europe sweep {origin} (duration {duration}): Google "
+                    f"returned nothing this time -- {e}"
+                )
+                found = []
+                if retries_left and self._serpapi_room(reserve=reserve) > 0:
+                    retries_left -= 1
+                    want += 1  # try the next slot in the rotation
             except GoogleDealsError as e:
                 self._note_error(f"Europe sweep {origin} (duration {duration}): {e}")
                 found, failed = [], True
@@ -462,6 +489,7 @@ class FlightDealBot:
             if failed:
                 break  # a key or quota problem won't resolve itself this run
             deals.extend(found)
+            i += 1
 
         listed = set(self.cfg.destination_codes)
         n_listed = sum(1 for d in deals if d.destination in listed)
@@ -624,8 +652,13 @@ class FlightDealBot:
             return []
         for f in getattr(self.rss, "failures", []) or []:
             # Per-feed failures are swallowed inside fetch_all so one dead
-            # blog can't take the others down; they still count as errors.
-            self._note_error(f"RSS feed failed: {redact(str(f))}")
+            # blog can't take the others down. They are a WARNING, not an
+            # error: the feeds are a best-effort extra on someone else's
+            # site, and counting them as errors failed the whole run (and
+            # sent a GitHub failure email) whenever a blog returned 403 --
+            # The Flight Deal started doing that to bots on 2026-11-18 --
+            # even though the fare sweep itself had worked.
+            self._note_warning(f"RSS feed failed: {f}")
 
         city_names = {
             d["code"]: d.get("city", d["code"]) for d in self.cfg.destinations
@@ -1000,7 +1033,7 @@ class FlightDealBot:
             observations=n_obs,
             candidates=len(final),
             alerts_sent=sent,
-            errors=self.errors,
+            errors=self.errors + [f"(warning) {w}" for w in self.warnings],
         )
         log.info("Run %d done: %d candidates, %d emails", run_id, len(final), sent)
         return sent
@@ -1059,6 +1092,24 @@ class FlightDealBot:
                  + ("   <-- worth a look" if len(blank) > 2 else ""))
         L.append(f"  SerpApi used:        {used_month} of {budget} this month")
         L.append("")
+
+        # Warnings never fail a run, so this is where they surface. A feed
+        # that has been dead all week shows up here with its count.
+        problems: Dict[str, int] = {}
+        for r in failed:
+            try:
+                msgs = json.loads(r["errors"])
+            except (TypeError, ValueError):
+                msgs = [str(r["errors"])]
+            for m in msgs:
+                problems[str(m)] = problems.get(str(m), 0) + 1
+        if problems:
+            L.append("-" * 58)
+            L.append("PROBLEMS SEEN THIS WEEK")
+            L.append("-" * 58)
+            for m, n in sorted(problems.items(), key=lambda kv: -kv[1])[:8]:
+                L.append(f"  {n}x  {m[:160]}")
+            L.append("")
 
         # The part that catches the slow rot: how close is anything getting?
         L.append("-" * 58)

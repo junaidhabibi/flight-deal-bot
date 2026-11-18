@@ -46,6 +46,25 @@ class GoogleDealsError(Exception):
     pass
 
 
+class GoogleDealsEmpty(GoogleDealsError):
+    """Google answered, but had nothing for this query right now.
+
+    SerpApi reports this through the same `error` field as a bad key or a
+    blown quota ("Empty results for departure_id: ..."), but it is nothing
+    like them: it is transient, the next query usually succeeds, and it
+    says nothing about the bot's health. Treating it as a hard error failed
+    roughly one run in ten and sent a GitHub failure email each time.
+    Persistent emptiness is still caught -- by the silence detector.
+    """
+
+
+def _raise_for_error(message: str) -> None:
+    low = message.lower()
+    if low.startswith("empty results") or "hasn't returned any results" in low:
+        raise GoogleDealsEmpty(message)
+    raise GoogleDealsError(message)
+
+
 class GoogleFlightDeals:
     def __init__(
         self,
@@ -91,7 +110,7 @@ class GoogleFlightDeals:
 
         data = resp.json()
         if "error" in data:
-            raise GoogleDealsError(str(data["error"]))
+            _raise_for_error(str(data["error"]))
 
         # Bill HERE, not at the point the request went out. SerpApi's FAQ:
         # "Only successful searches are counted toward your monthly
@@ -345,7 +364,7 @@ class GoogleTravelExplore:
 
         data = resp.json()
         if "error" in data:
-            raise GoogleDealsError(str(data["error"]))
+            _raise_for_error(str(data["error"]))
 
         # Bill only what SerpApi charges for. Their FAQ: "Only successful
         # searches are counted toward your monthly searches. Cached,

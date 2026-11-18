@@ -1688,6 +1688,67 @@ class TestEuropeSweep(unittest.TestCase):
         self.bot.scan_explore()
         self.assertEqual(len(attempts), 1, "kept burning searches after a 429")
 
+    def test_empty_results_is_not_an_error_and_tries_the_next_slot(self):
+        """SerpApi reports "Empty results" through its error field. It is
+        transient (about one run in ten) and used to fail the whole run."""
+        from bot.sources.google_deals import GoogleDealsEmpty
+        seen = []
+
+        def flaky(**kw):
+            seen.append(kw["travel_duration"])
+            if len(seen) == 1:
+                raise GoogleDealsEmpty('Empty results for departure_id: "DFW"')
+            return []
+
+        self.bot.explore.scan = flaky
+        self.bot.run_index = 0
+        self.bot.scan_explore()
+        rotation = self.cfg.sources["google_explore"]["rotation"]
+        self.assertEqual(seen, [rotation[0]["duration"], rotation[1]["duration"]])
+        self.assertEqual(self.bot.errors, [])
+        self.assertTrue(any("returned nothing" in w for w in self.bot.warnings))
+
+    def test_empty_results_retries_only_once(self):
+        from bot.sources.google_deals import GoogleDealsEmpty
+        attempts = []
+
+        def empty(**kw):
+            attempts.append(kw)
+            raise GoogleDealsEmpty("Empty results")
+
+        self.bot.explore.scan = empty
+        self.bot.scan_explore()
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(self.bot.errors, [])
+
+    def test_serpapi_empty_message_maps_to_the_empty_error(self):
+        from bot.sources.google_deals import GoogleDealsEmpty, GoogleDealsError
+
+        class R:
+            status_code = 200
+            def __init__(self, msg): self.msg = msg
+            def json(self): return {"error": self.msg}
+
+        self.bot.explore.session.get = lambda *a, **k: R(
+            'Empty results for departure_id: "DFW" and arrival_area_id: "/m/02j9z".')
+        with self.assertRaises(GoogleDealsEmpty):
+            self.bot.explore.explore(origin="DFW")
+        self.bot.explore.session.get = lambda *a, **k: R("Invalid API key.")
+        with self.assertRaises(GoogleDealsError) as cm:
+            self.bot.explore.explore(origin="DFW")
+        self.assertNotIsInstance(cm.exception, GoogleDealsEmpty)
+
+    def test_a_dead_rss_feed_does_not_fail_the_run(self):
+        """A blog answering 403 is not the bot failing."""
+        if not self.bot.rss:
+            self.skipTest("RSS disabled in config")
+        def forbidden(url, name=""):
+            raise RuntimeError("403 Client Error: Forbidden")
+        self.bot.rss.fetch_feed = forbidden
+        self.bot.scan_rss()
+        self.assertEqual(self.bot.errors, [])
+        self.assertTrue(self.bot.warnings)
+
     def test_successful_sweep_is_billed_once_per_call(self):
         self.cfg.sources["google_explore"]["calls_per_run"] = 2
 
@@ -2804,7 +2865,10 @@ class TestCalibrationStep(unittest.TestCase):
 
 
 class TestRSSFeedFailureIsAnError(unittest.TestCase):
-    """A dead feed was a log.warning nobody would ever read."""
+    """A dead feed was a log.warning nobody would ever read. It is now a
+    recorded WARNING: kept in the run history and listed in the weekly
+    check-in, but it no longer fails the GitHub run -- that sent a failure
+    email every time The Flight Deal answered 403."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -2825,8 +2889,19 @@ class TestRSSFeedFailureIsAnError(unittest.TestCase):
         self.bot.rss.fetch_feed = dead
         items = self.bot.scan_rss()
         self.assertEqual(items, [])
-        self.assertTrue(any("RSS feed failed" in e and "503" in e for e in self.bot.errors),
-                        self.bot.errors)
+        self.assertTrue(any("RSS feed failed" in e and "503" in e for e in self.bot.warnings),
+                        self.bot.warnings)
+        self.assertEqual(self.bot.errors, [], "a dead blog must not fail the run")
+
+    def test_warnings_reach_the_weekly_check_in(self):
+        sent = []
+        self.bot.emailer.send = lambda subject, body, *a, **k: sent.append(body) or True
+        rid = self.bot.hist.start_run()
+        self.bot.hist.finish_run(rid, observations=30,
+                                 errors=["(warning) RSS feed failed: The Flight Deal: 403"])
+        self.bot.heartbeat()
+        self.assertIn("PROBLEMS SEEN THIS WEEK", sent[-1])
+        self.assertIn("RSS feed failed: The Flight Deal: 403", sent[-1])
 
 
 
