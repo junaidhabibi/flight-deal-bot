@@ -1706,6 +1706,7 @@ class TestEuropeSweep(unittest.TestCase):
         rotation = self.cfg.sources["google_explore"]["rotation"]
         self.assertEqual(seen, [rotation[0]["duration"], rotation[1]["duration"]])
         self.assertEqual(self.bot.errors, [])
+        self.assertTrue(any("returned nothing" in w for w in self.bot.warnings))
 
     def test_empty_results_retries_only_once(self):
         from bot.sources.google_deals import GoogleDealsEmpty
@@ -1736,6 +1737,17 @@ class TestEuropeSweep(unittest.TestCase):
         with self.assertRaises(GoogleDealsError) as cm:
             self.bot.explore.explore(origin="DFW")
         self.assertNotIsInstance(cm.exception, GoogleDealsEmpty)
+
+    def test_a_dead_rss_feed_does_not_fail_the_run(self):
+        """A blog answering 403 is not the bot failing."""
+        if not self.bot.rss:
+            self.skipTest("RSS disabled in config")
+        def forbidden(url, name=""):
+            raise RuntimeError("403 Client Error: Forbidden")
+        self.bot.rss.fetch_feed = forbidden
+        self.bot.scan_rss()
+        self.assertEqual(self.bot.errors, [])
+        self.assertTrue(self.bot.warnings)
 
     def test_successful_sweep_is_billed_once_per_call(self):
         self.cfg.sources["google_explore"]["calls_per_run"] = 2
@@ -2853,7 +2865,10 @@ class TestCalibrationStep(unittest.TestCase):
 
 
 class TestRSSFeedFailureIsAnError(unittest.TestCase):
-    """A dead feed was a log.warning nobody would ever read."""
+    """A dead feed was a log.warning nobody would ever read. It is now a
+    recorded WARNING: kept in the run history and listed in the weekly
+    check-in, but it no longer fails the GitHub run -- that sent a failure
+    email every time The Flight Deal answered 403."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -2874,8 +2889,19 @@ class TestRSSFeedFailureIsAnError(unittest.TestCase):
         self.bot.rss.fetch_feed = dead
         items = self.bot.scan_rss()
         self.assertEqual(items, [])
-        self.assertTrue(any("RSS feed failed" in e and "503" in e for e in self.bot.errors),
-                        self.bot.errors)
+        self.assertTrue(any("RSS feed failed" in e and "503" in e for e in self.bot.warnings),
+                        self.bot.warnings)
+        self.assertEqual(self.bot.errors, [], "a dead blog must not fail the run")
+
+    def test_warnings_reach_the_weekly_check_in(self):
+        sent = []
+        self.bot.emailer.send = lambda subject, body, *a, **k: sent.append(body) or True
+        rid = self.bot.hist.start_run()
+        self.bot.hist.finish_run(rid, observations=30,
+                                 errors=["(warning) RSS feed failed: The Flight Deal: 403"])
+        self.bot.heartbeat()
+        self.assertIn("PROBLEMS SEEN THIS WEEK", sent[-1])
+        self.assertIn("RSS feed failed: The Flight Deal: 403", sent[-1])
 
 
 

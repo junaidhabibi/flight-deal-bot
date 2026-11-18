@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -96,6 +97,12 @@ class FlightDealBot:
         self.cfg = config
         self.dry_run = dry_run
         self.errors: List[str] = []
+        # Problems outside the bot's control that clear up on their own (a
+        # blog answering 403, Google briefly returning nothing). Recorded
+        # in the run history and listed in the weekly check-in, but they do
+        # NOT fail the GitHub run -- failing it sent a "run failed" email
+        # every day or two for things nobody could fix.
+        self.warnings: List[str] = []
 
         self.hist = History(config.db_path)
         self.scorer = DealScorer(config, self.hist)
@@ -325,6 +332,11 @@ class FlightDealBot:
         log.warning(msg)
         self.errors.append(msg)
 
+    def _note_warning(self, msg: str) -> None:
+        msg = redact(str(msg))
+        log.warning(msg)
+        self.warnings.append(msg)
+
     # ---------- scanning ----------
 
     # ---------- rotation ----------
@@ -454,9 +466,9 @@ class FlightDealBot:
                     carry_on_bags=bags,
                 )
             except GoogleDealsEmpty as e:
-                log.warning(
-                    "Europe sweep %s (duration %d): Google returned nothing "
-                    "this time -- %s", origin, duration, redact(str(e)),
+                self._note_warning(
+                    f"Europe sweep {origin} (duration {duration}): Google "
+                    f"returned nothing this time -- {e}"
                 )
                 found = []
                 if retries_left and self._serpapi_room(reserve=reserve) > 0:
@@ -640,8 +652,13 @@ class FlightDealBot:
             return []
         for f in getattr(self.rss, "failures", []) or []:
             # Per-feed failures are swallowed inside fetch_all so one dead
-            # blog can't take the others down; they still count as errors.
-            self._note_error(f"RSS feed failed: {redact(str(f))}")
+            # blog can't take the others down. They are a WARNING, not an
+            # error: the feeds are a best-effort extra on someone else's
+            # site, and counting them as errors failed the whole run (and
+            # sent a GitHub failure email) whenever a blog returned 403 --
+            # The Flight Deal started doing that to bots on 2026-11-18 --
+            # even though the fare sweep itself had worked.
+            self._note_warning(f"RSS feed failed: {f}")
 
         city_names = {
             d["code"]: d.get("city", d["code"]) for d in self.cfg.destinations
@@ -1016,7 +1033,7 @@ class FlightDealBot:
             observations=n_obs,
             candidates=len(final),
             alerts_sent=sent,
-            errors=self.errors,
+            errors=self.errors + [f"(warning) {w}" for w in self.warnings],
         )
         log.info("Run %d done: %d candidates, %d emails", run_id, len(final), sent)
         return sent
@@ -1075,6 +1092,24 @@ class FlightDealBot:
                  + ("   <-- worth a look" if len(blank) > 2 else ""))
         L.append(f"  SerpApi used:        {used_month} of {budget} this month")
         L.append("")
+
+        # Warnings never fail a run, so this is where they surface. A feed
+        # that has been dead all week shows up here with its count.
+        problems: Dict[str, int] = {}
+        for r in failed:
+            try:
+                msgs = json.loads(r["errors"])
+            except (TypeError, ValueError):
+                msgs = [str(r["errors"])]
+            for m in msgs:
+                problems[str(m)] = problems.get(str(m), 0) + 1
+        if problems:
+            L.append("-" * 58)
+            L.append("PROBLEMS SEEN THIS WEEK")
+            L.append("-" * 58)
+            for m, n in sorted(problems.items(), key=lambda kv: -kv[1])[:8]:
+                L.append(f"  {n}x  {m[:160]}")
+            L.append("")
 
         # The part that catches the slow rot: how close is anything getting?
         L.append("-" * 58)
